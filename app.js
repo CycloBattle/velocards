@@ -2,8 +2,8 @@
 /* =====================================================================
    Vélocards : front-end (JS pur, aucun outil de build)
    Toute la logique sensible (boosters, achats, points, récompenses,
-   cadeaux, validation des courses) est dans les fonctions SQL et les
-   Edge Functions de Supabase. Ici on ne fait qu'afficher.
+   cadeaux, boutique, validation des courses) est dans les fonctions SQL
+   et les Edge Functions de Supabase. Ici on ne fait qu'afficher.
    ===================================================================== */
 
 const sb = window.supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
@@ -132,6 +132,18 @@ const fmtClock = s => {
   const p = n => String(n).padStart(2, '0');
   return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
 };
+/* Compte à rebours avec jours : « 2 j 03:12:45 » */
+const fmtCountdown = s => {
+  s = Math.max(0, Math.floor(s));
+  const d = Math.floor(s / 86400), p = n => String(n).padStart(2, '0');
+  return `${d > 0 ? d + ' j ' : ''}${p(Math.floor((s % 86400) / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
+};
+/* Date ISO vers la valeur d'un champ datetime-local (heure locale) */
+const toLocalInput = iso => {
+  const d = new Date(iso), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+const fmtPct = n => `${(Math.round(n * 10) / 10).toLocaleString('fr-FR')} %`;
 /* Clé de comparaison de noms : sans accents, sans majuscules, espaces simplifiés */
 const nameKey = n => String(n ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
 /* Clé de rapprochement des noms de coureurs (résultats de course) : sans accents, sans ponctuation,
@@ -411,7 +423,7 @@ function renderAuth(mode = 'login') {
    COQUE + ROUTEUR
    ===================================================================== */
 const NAV = [
-  ['boosters', 'Boosters'], ['recompenses', 'Récompenses'], ['collection', 'Collection'], ['vitrine', 'Vitrine'], ['equipe', 'Équipe'],
+  ['boutique', 'Boutique'], ['recompenses', 'Récompenses'], ['collection', 'Collection'], ['vitrine', 'Vitrine'], ['equipe', 'Équipe'],
   ['transferts', 'Transferts'], ['messages', 'Messagerie'], ['portefeuille', 'Portefeuille'],
   ['classement', 'Classement UCI'],
 ];
@@ -420,7 +432,7 @@ function renderShell() {
   const p = state.profile;
   $('#root').innerHTML = `
     <header class="topbar">
-      <a class="brand" href="#/boosters">Vélo<small>cards</small></a>
+      <a class="brand" href="#/boutique">Vélo<small>cards</small></a>
       <a class="wallet" id="wallet" href="#/portefeuille" title="Ton portefeuille"></a>
       <a class="who" href="#/profil/${encodeURIComponent(p.username)}">${esc(p.username)}</a>
       <button class="btn small" id="logout" style="color:#fff;border-color:#fff">Quitter</button>
@@ -451,14 +463,15 @@ async function refreshProfile() {
 }
 
 const ROUTES = {
-  boosters: pageBoosters, recompenses: pageRewards, collection: pageCollection, vitrine: pageShowcase, equipe: pageTeam, transferts: pageTransfers,
+  boutique: pageShop, recompenses: pageRewards, collection: pageCollection, vitrine: pageShowcase, equipe: pageTeam, transferts: pageTransfers,
   messages: pageMessages, portefeuille: pageWallet, classement: pageRanking, profil: pageProfile, admin: pageAdmin,
 };
 
 async function route() {
   if (!state.uid || !app) return;
-  const [name = 'boosters', ...args] = location.hash.replace(/^#\/?/, '').split('/');
-  const key = ROUTES[name] ? name : 'boosters';
+  const [rawName = 'boutique', ...args] = location.hash.replace(/^#\/?/, '').split('/');
+  const name = rawName === 'boosters' ? 'boutique' : rawName;   // anciens liens « Boosters »
+  const key = ROUTES[name] ? name : 'boutique';
   $$('#nav a').forEach(a => a.classList.toggle('on', a.dataset.r === key));
   app.innerHTML = '<p class="muted">Chargement…</p>';
   try { await ROUTES[key](...args.map(decodeURIComponent)); }
@@ -483,7 +496,7 @@ async function handleSession(session) {
 sb.auth.onAuthStateChange((_evt, session) => setTimeout(() => handleSession(session), 0));
 
 /* =====================================================================
-   BOOSTERS EN STOCK (partagé entre « Boosters » et « Récompenses »)
+   BOOSTERS EN STOCK (partagé entre « Boutique » et « Récompenses »)
    ===================================================================== */
 function stockHTML(stock) {
   if (!stock.length) return '';
@@ -515,24 +528,139 @@ function bindStock(refresh) {
 }
 
 /* =====================================================================
-   PAGE : BOOSTERS
+   PAGE : BOUTIQUE
+   1. Boosters éphémères (offres limitées, créées par l'admin)
+   2. Boosters permanents (Bronze, Argent, Or)
+   3. Offres spéciales (cartes vendues à l'unité)
    ===================================================================== */
-async function pageBoosters() {
+let shopTimer = null;
+
+/* Probabilités normalisées d'une composition : [{ rarity, pct }] (rarétés à 0 % masquées) */
+function compOdds(comp) {
+  const w = comp?.weights || {};
+  const total = RARITY_ORDER.reduce((s, r) => s + Math.max(0, Number(w[r]) || 0), 0);
+  return RARITY_ORDER
+    .map(r => ({ rarity: r, pct: total ? (Math.max(0, Number(w[r]) || 0) / total) * 100 : 0 }))
+    .filter(o => o.pct > 0);
+}
+function guaranteeText(comp) {
+  const g = comp?.guarantee;
+  if (!g || !g.count || !RARITY[g.rarity]) return '';
+  return `Garanti : au moins ${g.count} carte${g.count > 1 ? 's' : ''} ${RARITY[g.rarity].label.toLowerCase()} ou mieux.`;
+}
+const ephPoolSize = b => (Array.isArray(b.composition_json?.rider_ids) ? b.composition_json.rider_ids.length : 0);
+
+/* Fenêtre « Voir le contenu » d'un booster éphémère : probabilités, garantie et pool de coureurs */
+async function showEphInfo(b) {
+  const comp = b.composition_json || {};
+  const ids = Array.isArray(comp.rider_ids) ? comp.rider_ids : [];
+  let pool = [];
+  if (ids.length) {
+    try { pool = await q(sb.from('riders').select('*').in('id', ids.slice(0, 60))); } catch (e) { pool = []; }
+    pool.sort((a, c) => rarityIdx(c.rarity) - rarityIdx(a.rarity) || a.name.localeCompare(c.name));
+  }
+  const odds = compOdds(comp);
+  const m = openModal(`<h2>${esc(b.name)}</h2>
+    ${b.description ? `<p class="muted">${esc(b.description)}</p>` : ''}
+    <p><b>${comp.cards || 5} cartes</b> par booster · <b>${coin(b.price)}</b></p>
+    <h3>Probabilités par carte</h3>
+    <div class="odds">${odds.map(o => `<div class="odds-row"><span>${RARITY[o.rarity].label}</span><b>${fmtPct(o.pct)}</b></div>`).join('')}</div>
+    ${guaranteeText(comp) ? `<p><b>${esc(guaranteeText(comp))}</b></p>` : ''}
+    <h3>${ids.length ? `Pool de coureurs (${ids.length})` : 'Pool de coureurs'}</h3>
+    ${ids.length
+      ? `<div class="cards">${pool.map(r => `<div class="card-wrap">${cardHTML(r)}</div>`).join('')}</div>
+         ${ids.length > pool.length ? `<p class="muted" style="margin-top:.6rem">… et ${ids.length - pool.length} autre${ids.length - pool.length > 1 ? 's' : ''} coureur${ids.length - pool.length > 1 ? 's' : ''}.</p>` : ''}`
+      : '<p class="muted">Pas de pool restreint : les cartes sont tirées dans tout le catalogue, selon les probabilités ci-dessus.</p>'}
+    <div class="row"><button class="btn primary" data-x>Fermer</button></div>`, { wide: true });
+  $('[data-x]', m.box).onclick = m.close;
+}
+
+async function pageShop() {
+  if (shopTimer) { clearInterval(shopTimer); shopTimer = null; }
+
   let stock = [];
   try { stock = await myBoosters(); } catch (e) { stock = []; }
-  app.innerHTML = `<h1>Boosters</h1>
-    <p class="lead">Chaque booster contient 5 cartes. Tu gagnes des pièces en alignant des coureurs qui marquent des points dans les vraies courses.</p>
+
+  let eph = [], offers = [], shopMissing = false;
+  const owned = new Map();                     // rider_id -> nombre d'exemplaires possédés
+  try {
+    const [e, o, ownedRows] = await Promise.all([
+      q(sb.from('ephemeral_boosters').select('*').eq('is_active', true).gt('end_date', new Date().toISOString()).order('end_date')),
+      q(sb.from('shop_cards').select('id,price,stock,rider_id,riders(*)').eq('is_active', true).order('created_at', { ascending: false })),
+      fetchAll(() => sb.from('user_cards').select('rider_id').eq('owner_id', state.uid).order('id')),
+    ]);
+    eph = e;
+    offers = o.filter(x => x.riders);
+    ownedRows.forEach(c => owned.set(c.rider_id, (owned.get(c.rider_id) || 0) + 1));
+  } catch (err) {
+    shopMissing = true;
+  }
+
+  const isLive = b => +new Date(b.start_date) <= Date.now();
+
+  const ephHTML = eph.map(b => {
+    const live = isLive(b);
+    const comp = b.composition_json || {};
+    const pool = ephPoolSize(b);
+    return `<article class="pack pack-eph">
+      <span class="pill ${live ? 'eph-pill' : 'soon'}">${live ? 'Édition limitée' : 'Bientôt disponible'}</span>
+      <div class="foil"><span>${esc(b.name)}</span>${b.image_url ? `<img src="${esc(b.image_url)}" alt="" onload="this.parentElement.classList.add('has-img')" onerror="this.remove()">` : ''}</div>
+      <div class="cd-box">${live ? 'Se termine dans' : 'Commence dans'}
+        <div class="cd" data-cd="${esc(live ? b.end_date : b.start_date)}">--</div></div>
+      ${b.description ? `<p>${esc(b.description)}</p>` : ''}
+      <p class="pool-note">${comp.cards || 5} cartes${pool ? ` · pool de ${pool} coureur${pool > 1 ? 's' : ''}` : ' · tout le catalogue'}</p>
+      <div class="btn-row">
+        <button class="btn small" data-eph-info="${b.id}">Voir le contenu</button>
+        <button class="btn primary" data-eph-buy="${b.id}" ${live ? '' : 'disabled'}>${live ? `Acheter pour ${coin(b.price)}` : 'Pas encore ouvert'}</button>
+      </div>
+    </article>`;
+  }).join('');
+
+  const offersHTML = offers.map(o => {
+    const r = o.riders;
+    const n = owned.get(r.id) || 0;
+    const out = o.stock !== null && o.stock <= 0;
+    return `<div class="card-wrap">${cardHTML(r, {
+      cls: 'pick ' + (out ? 'soldout' : ''), attrs: `data-rid="${r.id}" tabindex="0"`,
+      badge: n ? '✓ Possédée' : '', count: n,
+    })}
+      <div><b>${coin(o.price)}</b>${o.stock !== null
+        ? `<br><span class="muted">${out ? 'Épuisé' : `Plus que ${o.stock} exemplaire${o.stock > 1 ? 's' : ''}`}</span>` : ''}</div>
+      <button class="btn primary small" data-shop-buy="${o.id}" ${out ? 'disabled' : ''}>${out ? 'Épuisé' : 'Acheter'}</button></div>`;
+  }).join('');
+
+  app.innerHTML = `<h1>Boutique</h1>
+    <p class="lead">Boosters à durée limitée, boosters permanents et cartes à l'unité. Chaque booster contient des cartes de coureurs : aligne-les avant les courses pour gagner des pièces.</p>
     ${state.dailyAvailable ? `<div class="panel row">
       <div class="grow"><b>Ton booster gratuit du jour t'attend !</b></div>
       <a class="btn primary" href="#/recompenses" style="text-decoration:none">Aller aux récompenses</a></div>` : ''}
+    ${shopMissing && state.profile.is_admin ? `<div class="panel"><b class="error">Tables de la boutique introuvables.</b>
+      <span class="muted"> Exécute migration_shop.sql dans Supabase pour activer les boosters éphémères et les offres spéciales.</span></div>` : ''}
     ${stockHTML(stock)}
-    <div class="boosters">${Object.entries(BOOSTERS).map(([k, b]) => `
-      <article class="pack pack-${k}">
-        <div class="foil"><span>${b.name}</span><img src="img/boosters/${k}.png" alt="" onload="this.parentElement.classList.add('has-img')" onerror="this.remove()"></div>
-        <p>${b.odds}</p>
-        <button class="btn primary" data-open="${k}">Ouvrir pour ${coin(b.price)}</button>
-      </article>`).join('')}</div>`;
-  bindStock(() => pageBoosters());
+
+    ${eph.length ? `<section class="shop-sec">
+      <h2>Boosters éphémères</h2>
+      <p class="sub">Offres limitées dans le temps : une fois le compte à rebours terminé, elles disparaissent.</p>
+      <div class="boosters">${ephHTML}</div></section>` : ''}
+
+    <section class="shop-sec">
+      <h2>Boosters permanents</h2>
+      <p class="sub">Toujours disponibles. Chaque booster contient 5 cartes.</p>
+      <div class="boosters">${Object.entries(BOOSTERS).map(([k, b]) => `
+        <article class="pack pack-${k}">
+          <div class="foil"><span>${b.name}</span><img src="img/boosters/${k}.png" alt="" onload="this.parentElement.classList.add('has-img')" onerror="this.remove()"></div>
+          <p>${b.odds}</p>
+          <button class="btn primary" data-open="${k}">Ouvrir pour ${coin(b.price)}</button>
+        </article>`).join('')}</div></section>
+
+    ${offers.length ? `<section class="shop-sec">
+      <h2>Offres spéciales</h2>
+      <p class="sub">Des cartes précises, vendues directement. Clique sur une carte pour voir toutes ses compétences.</p>
+      <div class="cards" id="offerGrid">${offersHTML}</div></section>` : ''}`;
+
+  bindStock(() => pageShop());
+
+  /* ----- Boosters permanents ----- */
   $$('[data-open]').forEach(btn => btn.onclick = async () => {
     const type = btn.dataset.open;
     if (state.profile.coins < BOOSTERS[type].price) return toast('Pas assez de pièces pour ce booster.', 'error');
@@ -543,12 +671,76 @@ async function pageBoosters() {
     await refreshProfile();
     showReveal(type, r.data);
   });
+
+  /* ----- Boosters éphémères : contenu et achat ----- */
+  $$('[data-eph-info]').forEach(btn => btn.onclick = () => {
+    const b = eph.find(x => x.id === btn.dataset.ephInfo);
+    if (b) showEphInfo(b);
+  });
+  $$('[data-eph-buy]').forEach(btn => btn.onclick = async () => {
+    const b = eph.find(x => x.id === btn.dataset.ephBuy);
+    if (!b) return;
+    if (state.profile.coins < b.price) return toast('Pas assez de pièces pour ce booster.', 'error');
+    if (!await confirmBox(`Acheter « ${b.name} » pour ${b.price} pièces ?`, 'Acheter')) return;
+    $$('[data-eph-buy]').forEach(x => x.disabled = true);
+    const r = await rpc('buy_ephemeral_booster', { p_id: b.id });
+    if (!r.ok) { pageShop(); return; }
+    await refreshProfile();
+    showReveal('eph', r.data, b.name);
+    pageShop();
+  });
+
+  /* ----- Offres spéciales : détail et achat ----- */
+  const grid = $('#offerGrid');
+  if (grid) {
+    const openOffer = el => {
+      const c = el.closest('.card');
+      if (!c) return;
+      const o = offers.find(x => x.riders.id === +c.dataset.rid);
+      if (!o) return;
+      const n = owned.get(o.riders.id) || 0;
+      showRiderDetail(o.riders, n, n > 0);
+    };
+    grid.onclick = e => { if (!e.target.closest('button')) openOffer(e.target); };
+    grid.onkeydown = e => { if (e.key === 'Enter' && !e.target.closest('button')) openOffer(e.target); };
+  }
+  $$('[data-shop-buy]').forEach(btn => btn.onclick = async () => {
+    const o = offers.find(x => x.id === btn.dataset.shopBuy);
+    if (!o) return;
+    if (state.profile.coins < o.price) return toast('Pas assez de pièces pour cette carte.', 'error');
+    if (!await confirmBox(`Acheter ${o.riders.name} pour ${o.price} pièces ?`, 'Acheter')) return;
+    btn.disabled = true;
+    const r = await rpc('buy_shop_card', { p_shop_id: o.id });
+    if (!r.ok) { pageShop(); return; }
+    await refreshProfile();
+    showReveal('shop', [r.data], 'Carte achetée');
+    pageShop();
+  });
+
+  /* ----- Comptes à rebours (un seul minuteur pour toute la page) ----- */
+  if (eph.length) {
+    const tick = () => {
+      const els = $$('[data-cd]');
+      if (!els.length || !document.body.contains(els[0])) { clearInterval(shopTimer); shopTimer = null; return; }
+      let reload = false;
+      els.forEach(el => {
+        const left = Math.ceil((+new Date(el.dataset.cd) - Date.now()) / 1000);
+        if (left <= 0) reload = true; else el.textContent = fmtCountdown(left);
+      });
+      if (reload) { clearInterval(shopTimer); shopTimer = null; pageShop().catch(() => {}); }
+    };
+    shopTimer = setInterval(tick, 1000);
+    tick();
+  }
 }
 
-function showReveal(type, cards) {
+/* Animation d'ouverture : cartes face cachée à retourner.
+   type = booster permanent (bronze, silver, gold) ou libre ('eph', 'shop') avec un titre. */
+function showReveal(type, cards, title) {
   cards = [...cards].sort((a, b) => rarityIdx(a.rarity) - rarityIdx(b.rarity)); // la meilleure en dernier
+  const heading = title || BOOSTERS[type]?.name || 'Ouverture';
   const m = openModal(`<div class="reveal">
-    <h2>${BOOSTERS[type].name}</h2>
+    <h2>${esc(heading)}</h2>
     <p class="muted" style="text-align:center">Clique sur chaque carte pour la retourner.</p>
     <div class="reveal-grid">${cards.map(c => `
       <div class="flip" tabindex="0" role="button" aria-label="Retourner la carte">
@@ -672,7 +864,7 @@ async function pageCollection() {
     <p class="lead">${groups.length} coureurs différents sur ${all.length} au catalogue, ${cards.length} cartes au total. Clique sur une carte pour voir ses compétences.</p>
     <div id="col"></div>`;
   if (!cards.length) {
-    $('#col').innerHTML = `<div class="panel"><p>Ta vitrine est vide. <a href="#/boosters"><b>Ouvre ton premier booster</b></a> pour commencer.</p></div>`;
+    $('#col').innerHTML = `<div class="panel"><p>Ta vitrine est vide. <a href="#/boutique"><b>Ouvre ton premier booster</b></a> pour commencer.</p></div>`;
     return;
   }
   mountCollection($('#col'), cards);
@@ -1115,7 +1307,7 @@ async function pageMessages() {
       ${g.gold ? `<span class="gift-item"><span class="dpack gold"></span>×${g.gold}</span>` : ''}`;
     if (g.claimed_at) {
       return `<div class="gift">${items}</div>
-        <p class="muted gift-done">✓ Réclamés le ${fmtDate(g.claimed_at)}. <a href="#/boosters"><b>Ouvrir mes boosters</b></a></p>`;
+        <p class="muted gift-done">✓ Réclamés le ${fmtDate(g.claimed_at)}. <a href="#/boutique"><b>Ouvrir mes boosters</b></a></p>`;
     }
     return `<div class="gift">${items}<button class="btn primary" data-gift="${g.id}">Réclamer mes boosters</button></div>`;
   };
@@ -1375,10 +1567,358 @@ function parsePastedResults(text) {
 }
 
 /* =====================================================================
-   PAGE : ADMIN (validation de course, courses, coureurs, cadeaux de boosters, actualités)
+   PAGE : ADMIN (onglets « Général » et « Boutique »)
    ===================================================================== */
-async function pageAdmin() {
+const adminTabs = tab => `<div class="tabs">
+  <a href="#/admin/general" class="${tab === 'general' ? 'on' : ''}">Général</a>
+  <a href="#/admin/boutique" class="${tab === 'boutique' ? 'on' : ''}">Boutique</a></div>`;
+
+/* =====================================================================
+   ADMIN > BOUTIQUE : cartes en vente directe et boosters éphémères
+   ===================================================================== */
+async function adminShop() {
+  let ridersAll, offers, ephs;
+  try {
+    [ridersAll, offers, ephs] = await Promise.all([
+      fetchAll(() => sb.from('riders').select('id,name,rarity,team,country').order('name').order('id')),
+      q(sb.from('shop_cards').select('id,rider_id,price,stock,is_active,created_at,riders(id,name,rarity,team,country)').order('created_at', { ascending: false })),
+      q(sb.from('ephemeral_boosters').select('*').order('start_date', { ascending: false })),
+    ]);
+  } catch (e) {
+    app.innerHTML = `<h1>Administration</h1>${adminTabs('boutique')}
+      <div class="panel"><b class="error">Tables de la boutique introuvables.</b>
+      <p class="muted" style="margin:.4rem 0 0">Exécute migration_shop.sql dans Supabase (SQL Editor), puis recharge cette page. Détail : ${esc(e.message || e)}</p></div>`;
+    return;
+  }
+  const ridersById = new Map(ridersAll.map(r => [r.id, r]));
+  let picked = null;                           // coureur choisi pour une nouvelle offre
+
+  app.innerHTML = `<h1>Administration</h1>${adminTabs('boutique')}
+
+    <div class="panel"><h2>Cartes en vente directe</h2>
+      <p class="muted">Choisis un coureur du catalogue, fixe son prix et publie l'offre : elle apparaît dans « Offres spéciales » de la Boutique. Chaque achat crée un nouvel exemplaire dans la collection du joueur. Laisse le stock vide pour une vente illimitée.</p>
+      <label>Rechercher un coureur (nom ou équipe)<input id="sq2" placeholder="Ex. Pogačar ou UAE" autocomplete="off"></label>
+      <select id="ssel" size="6" style="width:100%;margin-top:.5rem" aria-label="Liste des coureurs"></select>
+      <p class="muted" id="spick" style="margin:.4rem 0 0">Aucun coureur sélectionné.</p>
+      <div class="filters">
+        <label>Prix (pièces)<input type="number" id="sprice" min="1" max="1000000" step="1" inputmode="numeric" style="width:140px"></label>
+        <label>Stock (optionnel)<input type="number" id="sstock" min="1" step="1" inputmode="numeric" placeholder="Illimité" style="width:140px"></label>
+        <button class="btn primary" id="sPub">Publier l'offre</button>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>Coureur</th><th>Rareté</th><th class="num">Prix</th><th class="num">Stock</th><th>Statut</th><th></th></tr></thead>
+        <tbody id="sbody"></tbody></table></div></div>
+
+    <div class="panel"><h2>Boosters éphémères</h2>
+      <p class="muted">Des boosters à durée limitée, avec leur propre visuel, prix et composition (probabilités par rareté, garantie, pool de coureurs). Ils apparaissent dans la Boutique entre leur date de début et leur date de fin, et s'ouvrent à l'achat.</p>
+      <p><button class="btn primary" id="eNew">Créer un booster éphémère</button></p>
+      <div class="table-wrap"><table><thead><tr><th>Booster</th><th class="num">Prix</th><th>Période</th><th>Pool</th><th>Statut</th><th></th></tr></thead>
+        <tbody id="ebody"></tbody></table></div></div>`;
+
+  /* ----- Cartes en vente directe ----- */
+  const drawPickList = () => {
+    const fq = nameKey($('#sq2').value);
+    const list = ridersAll.filter(r => !fq || nameKey(r.name).includes(fq) || nameKey(r.team).includes(fq));
+    const part = list.slice(0, 200);
+    $('#ssel').innerHTML = part.length
+      ? part.map(r => `<option value="${r.id}" ${picked && picked.id === r.id ? 'selected' : ''}>${esc(r.name)} · ${RARITY[r.rarity].label}${r.team ? ' · ' + esc(r.team) : ''}</option>`).join('')
+      : '<option value="" disabled>Aucun coureur ne correspond</option>';
+    if (list.length > part.length) {
+      $('#ssel').insertAdjacentHTML('beforeend', `<option value="" disabled>… ${list.length - part.length} autre(s) : affine la recherche</option>`);
+    }
+  };
+  const drawOffers = () => {
+    $('#sbody').innerHTML = offers.length ? offers.map(o => {
+      const r = o.riders || ridersById.get(o.rider_id);
+      return `<tr>
+        <td>${r ? `${flag(r.country)} <b>${esc(r.name)}</b>` : '?'}</td>
+        <td>${r ? RARITY[r.rarity].label : ''}</td>
+        <td class="num">${coin(o.price)}</td>
+        <td class="num">${o.stock === null ? '∞' : o.stock}</td>
+        <td><span class="pill ${o.is_active ? 'open' : ''}">${o.is_active ? 'En vente' : 'Retirée'}</span></td>
+        <td class="act">
+          <button class="btn small" data-sedit="${o.id}">Modifier</button>
+          <button class="btn small" data-stoggle="${o.id}">${o.is_active ? 'Retirer' : 'Republier'}</button>
+          <button class="btn small danger" data-sdel="${o.id}">Supprimer</button></td></tr>`;
+    }).join('') : '<tr><td colspan="6" class="muted">Aucune offre pour le moment.</td></tr>';
+  };
+  const reloadOffers = async () => {
+    offers = await q(sb.from('shop_cards').select('id,rider_id,price,stock,is_active,created_at,riders(id,name,rarity,team,country)').order('created_at', { ascending: false }));
+    drawOffers();
+  };
+  const readPosInt = (id, { allowEmpty = false, max = 1000000 } = {}) => {
+    const raw = $(id).value.trim();
+    if (raw === '') return allowEmpty ? null : NaN;
+    const v = Number(raw);
+    return Number.isInteger(v) && v >= 1 && v <= max ? v : NaN;
+  };
+
+  $('#sq2').oninput = drawPickList;
+  $('#ssel').onchange = () => {
+    picked = ridersById.get(+$('#ssel').value) || null;
+    $('#spick').textContent = picked ? `Coureur sélectionné : ${picked.name} (${RARITY[picked.rarity].label})` : 'Aucun coureur sélectionné.';
+  };
+  $('#sPub').onclick = async () => {
+    if (!picked) return toast('Choisis d\'abord un coureur dans la liste.', 'error');
+    const price = readPosInt('#sprice');
+    if (Number.isNaN(price)) return toast('Prix : un nombre entier de pièces (1 à 1 000 000).', 'error');
+    const stock = readPosInt('#sstock', { allowEmpty: true });
+    if (Number.isNaN(stock)) return toast('Stock : un nombre entier supérieur à 0, ou laisse vide.', 'error');
+    const btn = $('#sPub'); btn.disabled = true;
+    const { error } = await sb.from('shop_cards').insert({ rider_id: picked.id, price, stock });
+    btn.disabled = false;
+    if (error) {
+      return toast(/duplicate|unique/i.test(error.message) ? 'Ce coureur est déjà en vente : modifie l\'offre existante.' : error.message, 'error');
+    }
+    toast(`${picked.name} est en vente pour ${price} pièces.`, 'ok');
+    $('#sprice').value = ''; $('#sstock').value = '';
+    await reloadOffers();
+  };
+  $('#sbody').onclick = async e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    const id = b.dataset.sedit || b.dataset.stoggle || b.dataset.sdel;
+    const o = offers.find(x => x.id === id);
+    if (!o) return;
+    const r = o.riders || ridersById.get(o.rider_id);
+
+    if (b.dataset.stoggle) {
+      const { error } = await sb.from('shop_cards').update({ is_active: !o.is_active }).eq('id', o.id);
+      if (error) return toast(/duplicate|unique/i.test(error.message) ? 'Une autre offre active existe déjà pour ce coureur.' : error.message, 'error');
+      toast(o.is_active ? 'Offre retirée du marché.' : 'Offre republiée.', 'ok');
+      return reloadOffers();
+    }
+    if (b.dataset.sdel) {
+      if (!await confirmBox(`Supprimer définitivement l'offre de ${r ? r.name : 'ce coureur'} ?`, 'Supprimer')) return;
+      const { error } = await sb.from('shop_cards').delete().eq('id', o.id);
+      if (error) return toast(error.message, 'error');
+      toast('Offre supprimée.', 'ok');
+      return reloadOffers();
+    }
+    if (b.dataset.sedit) {
+      const m = openModal(`<h3>Modifier l'offre : ${esc(r ? r.name : '')}</h3>
+        <form id="sf" class="rform">
+          <label>Prix (pièces)<input name="price" type="number" min="1" max="1000000" step="1" required value="${o.price}"></label>
+          <label>Stock (vide = illimité)<input name="stock" type="number" min="0" step="1" value="${o.stock === null ? '' : o.stock}" placeholder="Illimité"></label>
+          <p id="serr" class="error" role="alert"></p>
+          <div class="row"><button type="button" class="btn" data-x>Annuler</button><button type="submit" class="btn primary">Enregistrer</button></div>
+        </form>`);
+      $('[data-x]', m.box).onclick = m.close;
+      $('#sf', m.box).onsubmit = async ev => {
+        ev.preventDefault();
+        const f = ev.target, err = $('#serr', m.box); err.textContent = '';
+        const price = Number(f.elements['price'].value);
+        const rawStock = f.elements['stock'].value.trim();
+        const stock = rawStock === '' ? null : Number(rawStock);
+        if (!Number.isInteger(price) || price < 1 || price > 1000000) { err.textContent = 'Prix invalide (entier de 1 à 1 000 000).'; return; }
+        if (stock !== null && (!Number.isInteger(stock) || stock < 0)) { err.textContent = 'Stock invalide (entier positif ou vide).'; return; }
+        const { error } = await sb.from('shop_cards').update({ price, stock }).eq('id', o.id);
+        if (error) { err.textContent = error.message; return; }
+        m.close();
+        toast('Offre modifiée.', 'ok');
+        reloadOffers();
+      };
+    }
+  };
+
+  /* ----- Boosters éphémères ----- */
+  const ephStatus = b => {
+    const now = Date.now();
+    if (!b.is_active) return { label: 'Désactivé', cls: 'pill' };
+    if (now < +new Date(b.start_date)) return { label: 'Programmé', cls: 'pill soon' };
+    if (now < +new Date(b.end_date)) return { label: 'En cours', cls: 'pill open' };
+    return { label: 'Terminé', cls: 'pill finished' };
+  };
+  const drawEph = () => {
+    $('#ebody').innerHTML = ephs.length ? ephs.map(b => {
+      const st = ephStatus(b), pool = ephPoolSize(b);
+      return `<tr>
+        <td><b>${esc(b.name)}</b><br><span class="muted">${b.composition_json?.cards || 5} cartes</span></td>
+        <td class="num">${coin(b.price)}</td>
+        <td>${fmtDate(b.start_date)}<br>→ ${fmtDate(b.end_date)}</td>
+        <td>${pool ? `${pool} coureur${pool > 1 ? 's' : ''}` : 'Tout le catalogue'}</td>
+        <td><span class="${st.cls}">${st.label}</span></td>
+        <td class="act">
+          <button class="btn small" data-eedit="${b.id}">Éditer</button>
+          <button class="btn small" data-etoggle="${b.id}">${b.is_active ? 'Désactiver' : 'Activer'}</button>
+          <button class="btn small danger" data-edel="${b.id}">Supprimer</button></td></tr>`;
+    }).join('') : '<tr><td colspan="6" class="muted">Aucun booster éphémère pour le moment.</td></tr>';
+  };
+  const reloadEph = async () => {
+    ephs = await q(sb.from('ephemeral_boosters').select('*').order('start_date', { ascending: false }));
+    drawEph();
+  };
+
+  /* Création / édition d'un booster éphémère (b = null pour une création) */
+  const editEph = b => {
+    const comp = b?.composition_json || {};
+    const w0 = comp.weights || { common: 70, rare: 25, ultra: 5 };
+    const pool = new Set((Array.isArray(comp.rider_ids) ? comp.rider_ids : []).map(Number));
+    const now = new Date();
+    const startV = toLocalInput(b ? b.start_date : now);
+    const endV = toLocalInput(b ? b.end_date : new Date(now.getTime() + 7 * 864e5));
+
+    const m = openModal(`<h3>${b ? 'Modifier' : 'Créer'} un booster éphémère</h3>
+      <form id="ef" class="rform">
+        <div class="formgrid">
+          <label>Nom<input name="name" required maxlength="60" value="${esc(b?.name || '')}"></label>
+          <label>Prix (pièces)<input name="price" type="number" min="1" max="1000000" step="1" required value="${b ? b.price : 500}"></label>
+          <label>Début de la vente<input name="start" type="datetime-local" required value="${startV}"></label>
+          <label>Fin de la vente<input name="end" type="datetime-local" required value="${endV}"></label>
+          <label>Nombre de cartes (1 à 10)<input name="cards" type="number" min="1" max="10" step="1" required value="${comp.cards || 5}"></label>
+          <label>Visuel (URL https:// ou chemin img/...)<input name="image" maxlength="500" placeholder="https://... ou img/shop/mon-booster.png" value="${esc(b?.image_url || '')}"></label>
+        </div>
+        <label>Description (500 caractères maximum)<textarea name="desc" maxlength="500" style="min-height:70px">${esc(b?.description || '')}</textarea></label>
+
+        <fieldset class="stats-edit weights"><legend>Probabilités par rareté (poids relatifs)</legend>
+          ${RARITY_ORDER.map(r => `<label>${RARITY[r].label}<input type="number" min="0" step="any" name="w_${r}" value="${Number(w0[r]) || 0}"></label>`).join('')}
+        </fieldset>
+        <p class="muted" id="eodds" style="margin:0"></p>
+
+        <div class="formgrid">
+          <label>Garantie de rareté<select name="grar"><option value="">Aucune</option>${RARITY_ORDER.slice(1).map(r => `<option value="${r}" ${comp.guarantee?.rarity === r ? 'selected' : ''}>${RARITY[r].label} ou mieux</option>`).join('')}</select></label>
+          <label>Nombre de cartes garanties<input name="gcount" type="number" min="0" max="10" step="1" value="${comp.guarantee?.count || 0}"></label>
+        </div>
+
+        <fieldset class="stats-edit" style="display:block"><legend>Pool de coureurs (vide = tout le catalogue)</legend>
+          <label>Rechercher un coureur (nom ou équipe)<input id="pq" placeholder="Ex. Pogačar ou UAE" autocomplete="off"></label>
+          <select id="plist" multiple size="6" style="width:100%;margin-top:.4rem" aria-label="Coureurs disponibles"></select>
+          <div class="btnrow">
+            <button type="button" class="btn small" id="padd">Ajouter la sélection</button>
+            <button type="button" class="btn small" id="paddall">Ajouter tous les résultats de la recherche</button>
+            <button type="button" class="btn small danger" id="pclear">Vider le pool</button>
+          </div>
+          <p class="muted" id="pcount" style="margin:0 0 .4rem"></p>
+          <div class="chips" id="pchips"></div>
+        </fieldset>
+
+        <p id="eerr" class="error" role="alert"></p>
+        <div class="row"><button type="button" class="btn" data-x>Annuler</button><button type="submit" class="btn primary">${b ? 'Enregistrer' : 'Créer le booster'}</button></div>
+      </form>`, { wide: true });
+
+    const f = $('#ef', m.box);
+    const filtered = () => {
+      const fq = nameKey($('#pq', m.box).value);
+      return ridersAll.filter(r => !pool.has(r.id) && (!fq || nameKey(r.name).includes(fq) || nameKey(r.team).includes(fq)));
+    };
+    const drawPool = () => {
+      const list = filtered();
+      $('#plist', m.box).innerHTML = list.length
+        ? list.slice(0, 300).map(r => `<option value="${r.id}">${esc(r.name)} · ${RARITY[r.rarity].label}${r.team ? ' · ' + esc(r.team) : ''}</option>`).join('')
+        : '<option value="" disabled>Aucun coureur ne correspond</option>';
+      $('#pcount', m.box).textContent = pool.size
+        ? `${pool.size} coureur${pool.size > 1 ? 's' : ''} dans le pool.`
+        : 'Pool vide : les cartes seront tirées dans tout le catalogue.';
+      const ids = [...pool];
+      $('#pchips', m.box).innerHTML = ids.slice(0, 80).map(id => {
+        const r = ridersById.get(id);
+        return `<span class="chip">${esc(r ? r.name : '#' + id)}<button type="button" data-rm="${id}" aria-label="Retirer">×</button></span>`;
+      }).join('') + (ids.length > 80 ? `<span class="muted">… et ${ids.length - 80} autre(s)</span>` : '');
+    };
+    const readComp = () => {
+      const weights = {};
+      RARITY_ORDER.forEach(r => { weights[r] = Math.max(0, Number(f.elements['w_' + r].value) || 0); });
+      const comp2 = { cards: parseInt(f.elements['cards'].value, 10) || 0, weights, rider_ids: [...pool] };
+      const gr = f.elements['grar'].value, gc = parseInt(f.elements['gcount'].value, 10) || 0;
+      if (gr && gc > 0) comp2.guarantee = { rarity: gr, count: gc };
+      return comp2;
+    };
+    const drawOdds = () => {
+      const odds = compOdds(readComp());
+      $('#eodds', m.box).textContent = odds.length
+        ? 'Probabilités par carte : ' + odds.map(o => `${RARITY[o.rarity].label} ${fmtPct(o.pct)}`).join(' · ')
+        : 'Renseigne au moins un poids supérieur à 0.';
+    };
+    RARITY_ORDER.forEach(r => { f.elements['w_' + r].oninput = drawOdds; });
+    drawPool(); drawOdds();
+
+    $('#pq', m.box).oninput = drawPool;
+    $('#padd', m.box).onclick = () => {
+      [...$('#plist', m.box).selectedOptions].forEach(o => { if (o.value) pool.add(+o.value); });
+      drawPool();
+    };
+    $('#paddall', m.box).onclick = () => {
+      if (!$('#pq', m.box).value.trim()) return toast('Tape d\'abord une recherche (nom ou équipe) avant d\'ajouter tous les résultats.', 'error');
+      filtered().forEach(r => pool.add(r.id));
+      drawPool();
+    };
+    $('#pclear', m.box).onclick = () => { pool.clear(); drawPool(); };
+    $('#pchips', m.box).onclick = e => {
+      const rm = e.target.closest('[data-rm]');
+      if (!rm) return;
+      pool.delete(+rm.dataset.rm);
+      drawPool();
+    };
+    $('[data-x]', m.box).onclick = m.close;
+
+    f.onsubmit = async e => {
+      e.preventDefault();
+      const err = $('#eerr', m.box); err.textContent = '';
+      const name = f.elements['name'].value.trim().replace(/\s+/g, ' ');
+      if (!name) { err.textContent = 'Le nom est obligatoire.'; return; }
+      const price = Number(f.elements['price'].value);
+      if (!Number.isInteger(price) || price < 1 || price > 1000000) { err.textContent = 'Prix invalide (entier de 1 à 1 000 000).'; return; }
+      const start = new Date(f.elements['start'].value), end = new Date(f.elements['end'].value);
+      if (isNaN(start) || isNaN(end)) { err.textContent = 'Dates invalides.'; return; }
+      if (end <= start) { err.textContent = 'La date de fin doit être après la date de début.'; return; }
+      const image = f.elements['image'].value.trim();
+      if (image && !/^(https:\/\/|img\/)/.test(image)) { err.textContent = 'Le visuel doit commencer par https:// ou img/.'; return; }
+      const composition = readComp();
+      if (composition.cards < 1 || composition.cards > 10) { err.textContent = 'Un booster contient de 1 à 10 cartes.'; return; }
+      if (!compOdds(composition).length) { err.textContent = 'Renseigne au moins une probabilité de rareté supérieure à 0.'; return; }
+      if (composition.guarantee && composition.guarantee.count > composition.cards) { err.textContent = 'Le nombre de cartes garanties dépasse la taille du booster.'; return; }
+
+      const payload = {
+        name,
+        description: f.elements['desc'].value.trim(),
+        price,
+        image_url: image || null,
+        start_date: start.toISOString(),
+        end_date: end.toISOString(),
+        composition_json: composition,
+        is_active: b ? b.is_active : true,
+      };
+      const btn = $('[type="submit"]', f); btn.disabled = true;
+      const { error } = b
+        ? await sb.from('ephemeral_boosters').update(payload).eq('id', b.id)
+        : await sb.from('ephemeral_boosters').insert(payload);
+      btn.disabled = false;
+      if (error) { err.textContent = error.message; return; }
+      m.close();
+      toast(b ? 'Booster modifié.' : 'Booster créé.', 'ok');
+      reloadEph();
+    };
+  };
+
+  $('#eNew').onclick = () => editEph(null);
+  $('#ebody').onclick = async e => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    const id = btn.dataset.eedit || btn.dataset.etoggle || btn.dataset.edel;
+    const b = ephs.find(x => x.id === id);
+    if (!b) return;
+    if (btn.dataset.eedit) return editEph(b);
+    if (btn.dataset.etoggle) {
+      const { error } = await sb.from('ephemeral_boosters').update({ is_active: !b.is_active }).eq('id', b.id);
+      if (error) return toast(error.message, 'error');
+      toast(b.is_active ? 'Booster désactivé.' : 'Booster activé.', 'ok');
+      return reloadEph();
+    }
+    if (btn.dataset.edel) {
+      if (!await confirmBox(`Supprimer définitivement le booster « ${b.name} » ?`, 'Supprimer')) return;
+      const { error } = await sb.from('ephemeral_boosters').delete().eq('id', b.id);
+      if (error) return toast(error.message, 'error');
+      toast('Booster supprimé.', 'ok');
+      reloadEph();
+    }
+  };
+
+  drawPickList(); drawOffers(); drawEph();
+}
+
+async function pageAdmin(tab = 'general') {
   if (!state.profile.is_admin) { app.innerHTML = '<p class="error">Accès réservé.</p>'; return; }
+  if (tab === 'boutique') return adminShop();
+
   const [races, ridersInit, playersInit] = await Promise.all([
     q(sb.from('races').select('*').eq('status', 'upcoming').order('start_at')),
     fetchAll(() => sb.from('riders').select('*').order('name').order('id')),
@@ -1392,7 +1932,7 @@ async function pageAdmin() {
   let picked = null;                 // joueur choisi pour le cadeau de boosters
   const rarityOptions = RARITY_ORDER.map(r => `<option value="${r}">${RARITY[r].label}</option>`).join('');
 
-  app.innerHTML = `<h1>Administration</h1>
+  app.innerHTML = `<h1>Administration</h1>${adminTabs('general')}
 
     <div class="panel"><h2>Validation de course</h2>
       <p class="muted">1. Choisis la course et colle le lien de sa page de résultats sur firstcycling.com. 2. Clique sur « Récupérer les résultats de la course » et vérifie le Top ${MAX_POSITION} (tu peux corriger un nom). 3. Clique sur « Valider et calculer les scores » : les points et pièces sont crédités aux joueurs et la course passe en « Terminée ». Les coureurs absents de ton catalogue sont ignorés. Action définitive.</p>
