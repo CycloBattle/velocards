@@ -410,3 +410,68 @@ code { background: #fff; border: 1px solid var(--line); border-radius: 4px; padd
 @media (max-width: 640px) {
   .stats-edit.weights { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* ---------- Profil, badges et classeur ---------- */
+.fav-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; max-width: 640px; }
+.fav-slot { display: grid; gap: .4rem; align-content: start; }
+.fav-empty {
+  aspect-ratio: 5 / 7; width: 100%; border: 3px dashed var(--line); border-radius: 12px;
+  background: #fff; color: var(--muted); cursor: pointer; padding: .5rem;
+  font: 700 1rem/1.2 var(--font-display); display: grid; place-items: center; text-align: center;
+}
+.fav-empty:hover { border-color: var(--ink); color: var(--ink); }
+.fav-empty span { font-size: 2rem; line-height: 1; }
+
+.badges-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: .8rem; }
+.badge-tile {
+  background: #fff; border: 2px solid var(--ink); border-radius: var(--radius);
+  padding: .8rem; display: grid; gap: .3rem; justify-items: center; text-align: center; align-content: start;
+}
+.badge-tile .bicon {
+  width: 58px; height: 58px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 30px; line-height: 1; background: var(--yellow); border: 3px solid var(--ink); overflow: hidden;
+}
+.badge-tile .bicon img { width: 100%; height: 100%; object-fit: cover; }
+.badge-tile b { font: 800 1.15rem/1.1 var(--font-display); }
+.badge-tile .bgoal { font-size: 12px; color: var(--muted); }
+.badge-tile .bdate { font-size: 12px; color: var(--green); font-weight: 700; }
+.badge-tile .prog { width: 100%; max-width: none; height: 8px; }
+.badge-tile.locked { border-color: var(--line); background: var(--surface); }
+.badge-tile.locked .bicon { filter: grayscale(1); opacity: .45; background: #E4E8EC; border-color: var(--line); }
+.badge-tile.locked b { color: var(--muted); }
+
+.album-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: .8rem; }
+.team-tile {
+  display: grid; gap: .4rem; align-content: start; text-decoration: none;
+  background: var(--surface); border: 2px solid var(--line); border-radius: var(--radius); padding: .8rem .9rem;
+}
+.team-tile:hover { border-color: var(--ink); }
+.team-tile h3 { margin: 0; }
+.team-tile.complete { border-color: var(--green); background: #EAF7EF; }
+.team-tile .prog { max-width: none; }
+.dots { display: flex; flex-wrap: wrap; gap: 3px; }
+.dots i { display: block; width: 9px; height: 12px; border-radius: 2px; background: #D5DAE0; }
+.dots i.on { background: var(--rc, var(--ink)); }
+
+.empty-slot {
+  aspect-ratio: 5 / 7; width: 100%; border: 3px dashed var(--rc, var(--line)); border-radius: 12px;
+  background: repeating-linear-gradient(45deg, #F1F3F5, #F1F3F5 8px, #EAEDF0 8px, #EAEDF0 16px);
+  display: grid; align-content: center; justify-items: center; gap: .25rem; padding: .5rem;
+  text-align: center; cursor: pointer; color: var(--muted); font-family: inherit;
+}
+.empty-slot:hover { background: #fff; }
+.empty-slot .num { font: 800 1.7rem/1 var(--font-display); color: var(--rc, var(--muted)); }
+.empty-slot b { font: 700 .95rem/1.1 var(--font-display); color: var(--ink); }
+.empty-slot small { font-size: 11px; }
+
+.sticker { animation: stick .45s ease-out both; }
+@keyframes stick {
+  from { transform: scale(1.12) rotate(-3deg); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sticker { animation: none; }
+}
+@media (max-width: 640px) {
+  .fav-grid { gap: .5rem; }
+}
