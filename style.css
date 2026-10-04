@@ -475,3 +475,40 @@ code { background: #fff; border: 1px solid var(--line); border-radius: 4px; padd
 @media (max-width: 640px) {
   .fav-grid { gap: .5rem; }
 }
+
+/* ---------- Prestige, rapport de course et classement officiel ---------- */
+.tier {
+  display: inline-block; font: 800 12px var(--font-display); letter-spacing: .04em;
+  padding: .1rem .6rem; border-radius: 999px; border: 2px solid var(--ink); white-space: nowrap;
+}
+.tier.t1 { background: linear-gradient(135deg, #FFD100, #E58A00); color: var(--ink); }
+.tier.t2 { background: #2C6BD8; border-color: #1B4AA0; color: #fff; }
+.tier.t3 { background: #E4E8EC; border-color: var(--line); color: var(--muted); }
+.race-item.t1 { border-left: 6px solid #E58A00; }
+.race-item.t2 { border-left: 6px solid #2C6BD8; }
+.race-item.t3 { border-left: 6px solid var(--line); }
+.race-item:hover { border-color: var(--ink); }
+
+.prestige-note { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+
+.rtable td, .rtable th { white-space: nowrap; }
+.rtable td.mul { text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
+.rtable td.tot { text-align: right; font: 800 1.2rem var(--font-display); }
+.rtable tr.mvp td { background: #FFF3B0; }
+.rtable .rar-note { display: block; font-size: 12px; color: var(--muted); white-space: normal; }
+.mvp-tag {
+  display: inline-block; background: var(--yellow); border: 2px solid var(--ink); border-radius: 999px;
+  font: 800 11px var(--font-display); padding: 0 .45rem; margin-left: .3rem; letter-spacing: .04em;
+}
+.mvp-box { background: #FFF3B0; border: 2px solid var(--ink); border-radius: var(--radius); padding: .5rem .8rem; }
+
+.top30 td { white-space: nowrap; }
+.top30 tr.p1 td { background: #FFF3B0; }
+.top30 tr.p2 td { background: #EEF1F4; }
+.top30 tr.p3 td { background: #F6E3D2; }
+.top30 tr.mine td:first-child { box-shadow: inset 5px 0 0 var(--green); }
+.top30 tr.mine td { font-weight: 700; }
+
+.cmark { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; min-height: 1.5rem; font-size: 13px; }
+.cmark b { font: 800 1.1rem var(--font-display); }
+.comp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: .8rem; margin: 1rem 0; }
