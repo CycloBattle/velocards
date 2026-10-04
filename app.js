@@ -2,8 +2,9 @@
 /* =====================================================================
    Vélocards : front-end (JS pur, aucun outil de build)
    Toute la logique sensible (boosters, achats, points, récompenses,
-   cadeaux, boutique, validation des courses) est dans les fonctions SQL
-   et les Edge Functions de Supabase. Ici on ne fait qu'afficher.
+   cadeaux, boutique, badges, validation des courses) est dans les
+   fonctions SQL et les Edge Functions de Supabase. Ici on ne fait
+   qu'afficher.
    ===================================================================== */
 
 const sb = window.supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
@@ -17,6 +18,7 @@ const RARITY = {
   mythic:    { label: 'Mythique vintage',  value: 1500, mult: 1.75 },
 };
 const RARITY_ORDER = ['common', 'rare', 'ultra', 'legendary', 'mythic'];
+const RARITY_COLOR = { common: '#6B7785', rare: '#2C6BD8', ultra: '#7B3FD4', legendary: '#B86A00', mythic: '#6E4A2A' };
 const RECYCLE_RATE = 0.12;
 
 /* Barème des courses d'un jour : points de base selon la place réelle (1er au 30e), 0 au-delà */
@@ -95,6 +97,18 @@ const STAT_DEFS = [
 const WEEKDAYS = ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'];
 const WEEKDAYS_LONG = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
 const dailyType = dow => (dow === 6 ? 'silver' : 'bronze');
+
+/* Classeur et badges (à garder alignés avec migration_badges.sql) */
+const TEAM_MIN = 2;                              // une équipe compte pour un badge à partir de 2 coureurs au catalogue
+const NO_TEAM = '_sans-equipe';                  // clé de la page « sans équipe » du classeur
+const NO_TEAM_LABEL = 'Légendes et coureurs sans équipe';
+const BADGE_TYPES = {
+  cards_total:     'Nombre de cartes possédées',
+  riders_distinct: 'Nombre de coureurs différents',
+  nation:          'Coureurs d\'une même nation',
+  rarity:          'Coureurs d\'une même rareté',
+  team_complete:   'Équipe complète',
+};
 
 /* ---------- Petits outils ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -289,6 +303,112 @@ function baremeTable() {
   </table></div>`;
 }
 
+/* ---------- Badges : texte de la condition, progression, icône, galerie ---------- */
+function criteriaText(b) {
+  const v = b.criteria_value, t = b.criteria_target || '';
+  switch (b.criteria_type) {
+    case 'cards_total':     return `Posséder ${v} carte${v > 1 ? 's' : ''}`;
+    case 'riders_distinct': return `Posséder ${v} coureur${v > 1 ? 's' : ''} différent${v > 1 ? 's' : ''}`;
+    case 'nation':          return `Posséder ${v} coureur${v > 1 ? 's' : ''} ${flag(t)} ${countryName(t)}`;
+    case 'rarity':          return `Posséder ${v} coureur${v > 1 ? 's' : ''} ${RARITY[t]?.label || t}`;
+    case 'team_complete':   return t ? `Compléter le classeur de ${t}` : `Compléter ${v} équipe${v > 1 ? 's' : ''}`;
+    default:                return '';
+  }
+}
+
+/* Contexte de calcul de la progression : cards = cartes possédées [{ rider_id }], riders = catalogue [{ id, team, country, rarity }] */
+function makeBadgeCtx(cards, riders) {
+  return { total: cards.length, owned: new Set(cards.map(c => c.rider_id)), riders };
+}
+
+/* Progression d'un badge { cur, target }. Doit rester identique à _badge_met() dans migration_badges.sql. */
+function badgeProgress(b, ctx) {
+  const v = b.criteria_value, t = b.criteria_target || '';
+  const ownedRiders = ctx.riders.filter(r => ctx.owned.has(r.id));
+  switch (b.criteria_type) {
+    case 'cards_total':     return { cur: ctx.total, target: v };
+    case 'riders_distinct': return { cur: ownedRiders.length, target: v };
+    case 'nation':          return { cur: ownedRiders.filter(r => r.country === t).length, target: v };
+    case 'rarity':          return { cur: ownedRiders.filter(r => r.rarity === t).length, target: v };
+    case 'team_complete': {
+      const teams = new Map();
+      ctx.riders.forEach(r => {
+        if (!r.team) return;
+        const s = teams.get(r.team) || { total: 0, got: 0 };
+        s.total++;
+        if (ctx.owned.has(r.id)) s.got++;
+        teams.set(r.team, s);
+      });
+      if (t) {
+        const s = teams.get(t);
+        return s ? { cur: s.got, target: Math.max(s.total, TEAM_MIN) } : { cur: 0, target: TEAM_MIN };
+      }
+      let done = 0;
+      teams.forEach(s => { if (s.total >= TEAM_MIN && s.got === s.total) done++; });
+      return { cur: done, target: v };
+    }
+    default: return { cur: 0, target: v };
+  }
+}
+
+function badgeIcon(b) {
+  return b.icon_url
+    ? `<img src="${esc(b.icon_url)}" alt="" data-fb="${esc(b.icon || '🏅')}" onerror="this.replaceWith(document.createTextNode(this.dataset.fb))">`
+    : esc(b.icon || '🏅');
+}
+
+/* Galerie de badges : débloqués en couleur, les autres grisés (avec leur progression si ctx est fourni) */
+function badgesGalleryHTML(badges, unlocked, ctx) {
+  if (!badges.length) return '<p class="muted">Aucun badge à débloquer pour le moment.</p>';
+  const list = [...badges].sort((a, b) =>
+    (unlocked.has(b.id) ? 1 : 0) - (unlocked.has(a.id) ? 1 : 0) || a.title.localeCompare(b.title));
+  return `<div class="badges-grid">${list.map(b => {
+    const at = unlocked.get(b.id);
+    let foot = '';
+    if (at) {
+      foot = `<span class="bdate">✓ Obtenu le ${esc(new Date(at).toLocaleDateString('fr-FR'))}</span>`;
+    } else if (ctx) {
+      const pr = badgeProgress(b, ctx);
+      const cur = Math.min(pr.cur, pr.target);
+      foot = `<div class="prog"><span style="width:${pr.target ? (cur / pr.target) * 100 : 0}%"></span></div><span class="bgoal">${cur} / ${pr.target}</span>`;
+    }
+    return `<div class="badge-tile ${at ? 'got' : 'locked'}">
+      <div class="bicon">${badgeIcon(b)}</div>
+      <b>${esc(b.title)}</b>
+      ${b.description ? `<span class="bgoal">${esc(b.description)}</span>` : ''}
+      <span class="bgoal">${esc(criteriaText(b))}</span>
+      ${foot}</div>`;
+  }).join('')}</div>`;
+}
+
+/* Vitrine (3 cartes favorites) et badges d'un joueur. Silencieux si le SQL n'est pas encore installé. */
+async function loadShowcase(userId) {
+  try {
+    const [favRows, badges, ubRows] = await Promise.all([
+      q(sb.from('user_favorites').select('slot_index,rider_id,riders(*)').eq('user_id', userId)),
+      q(sb.from('badges').select('*').order('criteria_type').order('criteria_value')),
+      q(sb.from('user_badges').select('badge_id,unlocked_at').eq('user_id', userId)),
+    ]);
+    const favs = [null, null, null];
+    favRows.forEach(f => { if (f.riders && f.slot_index >= 0 && f.slot_index < 3) favs[f.slot_index] = f.riders; });
+    return {
+      missing: false, favs,
+      badges: badges.filter(b => b.is_active),
+      unlocked: new Map(ubRows.map(u => [u.badge_id, u.unlocked_at])),
+    };
+  } catch (e) {
+    return { missing: true, favs: [null, null, null], badges: [], unlocked: new Map() };
+  }
+}
+
+/* Vitrine en lecture seule (profil public) */
+function favsReadonlyHTML(favs) {
+  if (!favs.some(Boolean)) return '<p class="muted">Aucune carte exposée pour le moment.</p>';
+  return `<div class="fav-grid">${favs.map(r => r
+    ? `<div class="fav-slot"><div class="card-wrap">${cardHTML(r, { cls: 'pick', attrs: `data-fav-rid="${r.id}" tabindex="0"` })}</div></div>`
+    : '<div class="fav-slot"></div>').join('')}</div>`;
+}
+
 /* ---------- Données partagées ---------- */
 const myCards = () => q(sb.from('user_cards').select('id,rider_id,acquired_at,riders(*)').eq('owner_id', state.uid));
 
@@ -423,7 +543,7 @@ function renderAuth(mode = 'login') {
    COQUE + ROUTEUR
    ===================================================================== */
 const NAV = [
-  ['boutique', 'Boutique'], ['recompenses', 'Récompenses'], ['collection', 'Collection'], ['vitrine', 'Vitrine'], ['equipe', 'Équipe'],
+  ['boutique', 'Boutique'], ['recompenses', 'Récompenses'], ['collection', 'Collection'], ['classeur', 'Classeur'], ['vitrine', 'Vitrine'], ['equipe', 'Équipe'],
   ['transferts', 'Transferts'], ['messages', 'Messagerie'], ['portefeuille', 'Portefeuille'],
   ['classement', 'Classement UCI'],
 ];
@@ -463,7 +583,7 @@ async function refreshProfile() {
 }
 
 const ROUTES = {
-  boutique: pageShop, recompenses: pageRewards, collection: pageCollection, vitrine: pageShowcase, equipe: pageTeam, transferts: pageTransfers,
+  boutique: pageShop, recompenses: pageRewards, collection: pageCollection, classeur: pageAlbum, vitrine: pageShowcase, equipe: pageTeam, transferts: pageTransfers,
   messages: pageMessages, portefeuille: pageWallet, classement: pageRanking, profil: pageProfile, admin: pageAdmin,
 };
 
@@ -485,6 +605,7 @@ async function handleSession(session) {
   state.uid = uid; state.user = session?.user || null;
   if (!uid) { state.profile = null; state.dailyAvailable = false; app = null; renderAuth(); return; }
   try {
+    try { await sb.rpc('check_my_badges'); } catch (e) { /* badges non installés : on continue */ }
     await refreshProfile();
     await refreshDaily();
     renderShell();
@@ -868,6 +989,118 @@ async function pageCollection() {
     return;
   }
   mountCollection($('#col'), cards);
+}
+
+/* =====================================================================
+   PAGE : CLASSEUR (album d'exposition façon Panini, par équipe)
+   Chaque coureur du catalogue a une case. Si tu possèdes la carte, elle
+   « se colle » automatiquement dans sa case. Compteur par équipe.
+   Route : #/classeur (toutes les équipes) ou #/classeur/<équipe>
+   ===================================================================== */
+async function pageAlbum(teamKey) {
+  const [riders, ownedRows] = await Promise.all([
+    fetchAll(() => sb.from('riders').select('*').order('name').order('id')),
+    fetchAll(() => sb.from('user_cards').select('rider_id').eq('owner_id', state.uid).order('id')),
+  ]);
+  const owned = new Map();                          // rider_id -> nombre d'exemplaires
+  ownedRows.forEach(c => owned.set(c.rider_id, (owned.get(c.rider_id) || 0) + 1));
+
+  /* Une page d'album par équipe (les coureurs sans équipe sont regroupés) */
+  const map = new Map();
+  riders.forEach(r => {
+    const key = r.team || NO_TEAM;
+    if (!map.has(key)) map.set(key, { key, name: r.team || NO_TEAM_LABEL, riders: [] });
+    map.get(key).riders.push(r);
+  });
+  const teams = [...map.values()].map(t => {
+    t.riders.sort((a, b) => rarityIdx(b.rarity) - rarityIdx(a.rarity) || a.name.localeCompare(b.name));
+    t.total = t.riders.length;
+    t.got = t.riders.filter(r => owned.has(r.id)).length;
+    t.pct = t.total ? Math.round((t.got / t.total) * 100) : 0;
+    t.complete = t.total > 0 && t.got === t.total;
+    return t;
+  });
+  const ownedDistinct = riders.filter(r => owned.has(r.id)).length;
+
+  /* ----- Une page d'équipe ----- */
+  if (teamKey) {
+    const t = teams.find(x => x.key === teamKey);
+    if (!t) {
+      app.innerHTML = `<p><a href="#/classeur">← Toutes les équipes</a></p><p class="error">Équipe introuvable dans le classeur.</p>`;
+      return;
+    }
+    app.innerHTML = `<p><a href="#/classeur">← Toutes les équipes</a></p>
+      <h1>${esc(t.name)}</h1>
+      <div class="panel showcase-head">
+        <div class="stat"><b>${t.got}/${t.total}</b><span>cartes collées - ${t.pct} %</span></div>
+        <div class="grow"><div class="prog" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${t.pct}"><span style="width:${t.pct}%"></span></div></div>
+      </div>
+      ${t.complete ? `<div class="panel"><b>🏆 Page complète !</b>
+        <span class="muted">${t.key !== NO_TEAM && t.total >= TEAM_MIN ? ' Cette équipe compte pour les badges « Équipe complète ».' : ''}</span></div>` : ''}
+      <div class="filters"><label>Afficher<select id="af"><option value="">Toutes les cases</option><option value="got">Cartes collées</option><option value="miss">Cases vides</option></select></label></div>
+      <div class="cards" id="agrid"></div>`;
+
+    const draw = () => {
+      const f = $('#af').value;
+      const list = t.riders.filter(r => f === 'got' ? owned.has(r.id) : f === 'miss' ? !owned.has(r.id) : true);
+      $('#agrid').innerHTML = list.length ? list.map(r => {
+        const n = owned.get(r.id) || 0;
+        return n
+          ? `<div class="card-wrap sticker">${cardHTML(r, { cls: 'pick', attrs: `data-rid="${r.id}" tabindex="0"`, count: n })}</div>`
+          : `<div class="card-wrap"><button class="empty-slot" style="--rc:${RARITY_COLOR[r.rarity]}" data-rid="${r.id}">
+              <span class="num">${String(r.id).padStart(3, '0')}</span><b>${esc(r.name)}</b>
+              <small>${flag(r.country)} ${esc(r.specialty)} · ${RARITY[r.rarity].label}</small>
+              <small>Emplacement vide</small></button></div>`;
+      }).join('') : '<p class="muted">Aucune case à afficher.</p>';
+    };
+    const openSlot = el => {
+      const c = el.closest('[data-rid]');
+      if (!c) return;
+      const r = riders.find(x => x.id === +c.dataset.rid);
+      if (!r) return;
+      const n = owned.get(r.id) || 0;
+      showRiderDetail(r, n, n > 0);
+    };
+    $('#af').oninput = draw;
+    $('#agrid').onclick = e => openSlot(e.target);
+    $('#agrid').onkeydown = e => { if (e.key === 'Enter') openSlot(e.target); };
+    draw();
+    return;
+  }
+
+  /* ----- Vue d'ensemble : toutes les équipes ----- */
+  const completeTeams = teams.filter(t => t.complete && t.key !== NO_TEAM).length;
+  const realTeams = teams.filter(t => t.key !== NO_TEAM).length;
+  const gpct = riders.length ? Math.round((ownedDistinct / riders.length) * 100) : 0;
+  app.innerHTML = `<h1>Classeur</h1>
+    <p class="lead">Un album par équipe : chaque coureur a sa case. Quand tu possèdes sa carte, elle se colle toute seule dans le classeur. Complète une équipe à 100 % pour débloquer des badges.</p>
+    <div class="panel showcase-head">
+      <div class="stat"><b>${ownedDistinct}/${riders.length}</b><span>cartes collées - ${gpct} %</span></div>
+      <div class="stat"><b>${completeTeams}/${realTeams}</b><span>équipes complètes</span></div>
+      <div class="grow"><div class="prog" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${gpct}"><span style="width:${gpct}%"></span></div></div>
+    </div>
+    <div class="filters">
+      <label>Rechercher une équipe<input id="aq" placeholder="Ex. UAE ou Visma"></label>
+      <label>Tri<select id="as"><option value="name">Nom</option><option value="pct">Complétion</option><option value="got">Cartes collées</option></select></label>
+    </div>
+    <div class="album-tiles" id="tiles"></div>`;
+
+  const drawTiles = () => {
+    const fq = nameKey($('#aq').value), fs = $('#as').value;
+    const list = teams.filter(t => !fq || nameKey(t.name).includes(fq)).sort((a, b) =>
+      (a.key === NO_TEAM ? 1 : 0) - (b.key === NO_TEAM ? 1 : 0)
+      || (fs === 'pct' ? b.pct - a.pct || b.got - a.got : fs === 'got' ? b.got - a.got : 0)
+      || a.name.localeCompare(b.name));
+    $('#tiles').innerHTML = list.length ? list.map(t => `<a class="team-tile ${t.complete ? 'complete' : ''}" href="#/classeur/${encodeURIComponent(t.key)}">
+        <h3>${esc(t.name)}${t.complete ? ' ✓' : ''}</h3>
+        <span class="muted">${t.got}/${t.total} cartes collées - ${t.pct} %</span>
+        <div class="prog"><span style="width:${t.pct}%"></span></div>
+        <div class="dots">${t.riders.slice(0, 40).map(r => `<i class="${owned.has(r.id) ? 'on' : ''}" style="--rc:${RARITY_COLOR[r.rarity]}"></i>`).join('')}</div>
+      </a>`).join('') : '<p class="muted">Aucune équipe ne correspond.</p>';
+  };
+  $('#aq').oninput = drawTiles;
+  $('#as').oninput = drawTiles;
+  drawTiles();
 }
 
 /* =====================================================================
@@ -1350,19 +1583,43 @@ async function pageMessages() {
 }
 
 /* =====================================================================
-   PAGE : PORTEFEUILLE
+   PAGE : PORTEFEUILLE (solde, points, vitrine de 3 cartes, badges, résultats)
    ===================================================================== */
 async function pageWallet() {
   await refreshProfile();
   const p = state.profile;
-  const hist = await q(sb.from('lineups').select('points,coins_earned,races!inner(name,start_at,status)').eq('user_id', state.uid).eq('races.status', 'finished'));
+  const [hist, cards, catalog, show] = await Promise.all([
+    q(sb.from('lineups').select('points,coins_earned,races!inner(name,start_at,status)').eq('user_id', state.uid).eq('races.status', 'finished')),
+    myCards(),
+    fetchAll(() => sb.from('riders').select('id,team,country,rarity').order('id')),
+    loadShowcase(state.uid),
+  ]);
   hist.sort((a, b) => +new Date(b.races.start_at) - +new Date(a.races.start_at));
+  const groups = groupByRider(cards);
+  const favs = show.favs;                                    // 3 emplacements : coureur ou null
+  const ctx = makeBadgeCtx(cards, catalog);
+  const got = show.badges.filter(b => show.unlocked.has(b.id)).length;
+  const countOf = id => groups.find(g => g.rider.id === id)?.cards.length || 0;
+
   app.innerHTML = `<h1>Portefeuille</h1>
     <div class="stat-row">
       <div class="stat"><b>${coin(p.coins)}</b><span>Solde</span></div>
       <div class="stat"><b>${p.points_total}</b><span>Points au classement UCI</span></div>
+      <div class="stat"><b>${groups.length}</b><span>coureurs différents (${cards.length} cartes)</span></div>
+      <div class="stat"><b>${got}/${show.badges.length}</b><span>badges débloqués</span></div>
     </div>
-    <p><a class="btn" href="#/profil/${encodeURIComponent(p.username)}" style="text-decoration:none;display:inline-block">Voir mon profil public</a></p>
+    <p class="row">
+      <a class="btn" href="#/profil/${encodeURIComponent(p.username)}" style="text-decoration:none;display:inline-block">Voir mon profil public</a>
+      <a class="btn" href="#/classeur" style="text-decoration:none;display:inline-block">Ouvrir mon classeur</a>
+    </p>
+
+    <h2 style="margin-top:1.5rem">Ma vitrine</h2>
+    <p class="muted">Expose jusqu'à 3 cartes de ta collection en haut de ton profil public.</p>
+    ${show.missing ? '<div class="panel muted">La vitrine et les badges seront disponibles dès que migration_badges.sql aura été exécuté dans Supabase.</div>' : '<div id="favs"></div>'}
+
+    <h2 style="margin-top:1.5rem">Mes badges</h2>
+    ${show.missing ? '' : badgesGalleryHTML(show.badges, show.unlocked, ctx)}
+
     <h2 style="margin-top:1.5rem">Mes résultats</h2>
     ${hist.length ? `<div class="table-wrap"><table><thead><tr><th>Course</th><th>Date</th><th class="num">Points</th><th class="num">Pièces gagnées</th></tr></thead><tbody>
       ${hist.map(h => `<tr><td>${esc(h.races.name)}</td><td>${fmtDate(h.races.start_at)}</td><td class="num">${h.points}</td><td class="num">+${h.coins_earned}</td></tr>`).join('')}
@@ -1373,6 +1630,80 @@ async function pageWallet() {
       <p>Multiplicateur de rareté : ${RARITY_ORDER.map(r => `${RARITY[r].label} ×${RARITY[r].mult}`).join(', ')}. Capitaine ×${CAPTAIN_MULT} s'il termine dans le Top ${CAPTAIN_TOP}. Les cartes mythiques vintage (coureurs retraités) rapportent un bonus fixe de ${MYTHIC_BONUS} points à chaque course. 1 point = 1 pièce.</p>
       <details><summary><b>Tableau complet</b></summary>${baremeTable()}</details>
     </div>`;
+
+  if (show.missing) return;
+
+  /* ----- Vitrine : 3 emplacements modifiables ----- */
+  const drawFavs = () => {
+    $('#favs').innerHTML = `<div class="fav-grid">${favs.map((r, i) => `<div class="fav-slot">${r
+      ? `<div class="card-wrap">${cardHTML(r, { cls: 'pick', attrs: `data-fav-detail="${i}" tabindex="0"` })}</div>
+         <div class="btn-row"><button class="btn small" data-fav-change="${i}">Changer</button><button class="btn small danger" data-fav-clear="${i}">Retirer</button></div>`
+      : `<button class="fav-empty" data-fav-change="${i}"><div><span>＋</span><br>Ajouter une carte</div></button>`}</div>`).join('')}</div>`;
+  };
+  const saveFavs = async next => {
+    const r = await rpc('set_favorites', { p_rider_ids: next.map(x => (x ? x.id : null)) });
+    if (!r.ok) return false;
+    next.forEach((x, i) => { favs[i] = x; });
+    drawFavs();
+    return true;
+  };
+  const pickFav = slot => {
+    const taken = new Set(favs.filter((r, i) => r && i !== slot).map(r => r.id));
+    const m = openModal(`<h3>Choisir une carte pour l'emplacement ${slot + 1}</h3>
+      <div class="filters">
+        <label>Rareté<select id="pfr"><option value="">Toutes</option>${RARITY_ORDER.map(r => `<option value="${r}">${RARITY[r].label}</option>`).join('')}</select></label>
+        <label>Recherche<input id="pfq" placeholder="Nom du coureur"></label>
+      </div>
+      <div class="cards" id="pgrid"></div>
+      <div class="row"><button class="btn" data-x>Fermer</button></div>`, { wide: true });
+    const draw = () => {
+      const fr = $('#pfr', m.box).value, fq = $('#pfq', m.box).value.toLowerCase();
+      const list = groups.filter(g => !taken.has(g.rider.id) && (!fr || g.rider.rarity === fr) && g.rider.name.toLowerCase().includes(fq))
+        .sort((a, b) => rarityIdx(b.rider.rarity) - rarityIdx(a.rider.rarity) || a.rider.name.localeCompare(b.rider.name));
+      $('#pgrid', m.box).innerHTML = list.length
+        ? list.map(g => `<div class="card-wrap">${cardHTML(g.rider, { cls: 'pick', attrs: `data-pick="${g.rider.id}" tabindex="0"`, count: g.cards.length })}</div>`).join('')
+        : '<p class="muted">Aucune carte disponible.</p>';
+    };
+    const choose = async el => {
+      const c = el.closest('[data-pick]');
+      if (!c) return;
+      const g = groups.find(x => x.rider.id === +c.dataset.pick);
+      if (!g) return;
+      const next = [...favs];
+      next[slot] = g.rider;
+      if (await saveFavs(next)) m.close();
+    };
+    $('#pfr', m.box).oninput = draw;
+    $('#pfq', m.box).oninput = draw;
+    $('#pgrid', m.box).onclick = e => choose(e.target);
+    $('#pgrid', m.box).onkeydown = e => { if (e.key === 'Enter') choose(e.target); };
+    $('[data-x]', m.box).onclick = m.close;
+    draw();
+  };
+  $('#favs').onclick = async e => {
+    const b = e.target.closest('button');
+    if (b && b.dataset.favChange !== undefined) return pickFav(+b.dataset.favChange);
+    if (b && b.dataset.favClear !== undefined) {
+      const next = [...favs];
+      next[+b.dataset.favClear] = null;
+      await saveFavs(next);
+      return;
+    }
+    const d = e.target.closest('[data-fav-detail]');
+    if (d) {
+      const r = favs[+d.dataset.favDetail];
+      if (r) showRiderDetail(r, countOf(r.id));
+    }
+  };
+  $('#favs').onkeydown = e => {
+    if (e.key !== 'Enter') return;
+    const d = e.target.closest('[data-fav-detail]');
+    if (d) {
+      const r = favs[+d.dataset.favDetail];
+      if (r) showRiderDetail(r, countOf(r.id));
+    }
+  };
+  drawFavs();
 }
 
 /* =====================================================================
@@ -1405,26 +1736,48 @@ async function pageRanking() {
 }
 
 /* =====================================================================
-   PAGE : PROFIL PUBLIC
+   PAGE : PROFIL PUBLIC (vitrine, badges, collection)
    ===================================================================== */
 async function pageProfile(username) {
   if (!username) username = state.profile.username;
   const p = await q(sb.from('public_profiles').select('*').eq('username', username.toLowerCase()).maybeSingle());
   if (!p) { app.innerHTML = '<p class="error">Joueur introuvable.</p>'; return; }
-  const [cards, ahead] = await Promise.all([
+  const [cards, ahead, show] = await Promise.all([
     q(sb.from('user_cards').select('id,rider_id,acquired_at,riders(*)').eq('owner_id', p.id)),
     sb.from('public_profiles').select('id', { count: 'exact', head: true }).gt('points_total', p.points_total),
+    loadShowcase(p.id),
   ]);
   const counts = Object.fromEntries(RARITY_ORDER.map(r => [r, cards.filter(c => c.riders.rarity === r).length]));
+  const mine = p.id === state.uid;
+  const got = show.badges.filter(b => show.unlocked.has(b.id)).length;
   app.innerHTML = `<h1>${esc(p.username)}</h1>
     <div class="stat-row">
       <div class="stat"><b>${(ahead.count ?? 0) + 1}<sup style="font-size:.5em">e</sup></b><span>au classement</span></div>
       <div class="stat"><b>${p.points_total}</b><span>points</span></div>
       <div class="stat"><b>${cards.length}</b><span>cartes (${groupByRider(cards).length} coureurs)</span></div>
+      ${show.missing ? '' : `<div class="stat"><b>${got}/${show.badges.length}</b><span>badges</span></div>`}
     </div>
     <p class="muted">${RARITY_ORDER.slice().reverse().filter(r => counts[r]).map(r => `${counts[r]} ${RARITY[r].label.toLowerCase()}${counts[r] > 1 ? 's' : ''}`).join(', ') || 'Vitrine vide.'}</p>
+    ${show.missing ? '' : `<h2 style="margin-top:1.5rem">Cartes favorites</h2>
+      ${mine ? '<p><a href="#/portefeuille"><b>Modifier ma vitrine</b></a></p>' : ''}
+      <div id="favs">${favsReadonlyHTML(show.favs)}</div>
+      <h2 style="margin-top:1.5rem">Badges</h2>
+      ${badgesGalleryHTML(show.badges, show.unlocked, null)}`}
+    <h2 style="margin-top:1.5rem">Collection</h2>
     <div id="col"></div>`;
+  const favBox = $('#favs');
+  if (favBox) {
+    const openFav = el => {
+      const c = el.closest('[data-fav-rid]');
+      if (!c) return;
+      const r = show.favs.find(x => x && x.id === +c.dataset.favRid);
+      if (r) showRiderDetail(r, cards.filter(x => x.rider_id === r.id).length);
+    };
+    favBox.onclick = e => openFav(e.target);
+    favBox.onkeydown = e => { if (e.key === 'Enter') openFav(e.target); };
+  }
   if (cards.length) mountCollection($('#col'), cards);
+  else $('#col').innerHTML = '<p class="muted">Collection vide.</p>';
 }
 
 /* =====================================================================
@@ -1567,11 +1920,199 @@ function parsePastedResults(text) {
 }
 
 /* =====================================================================
-   PAGE : ADMIN (onglets « Général » et « Boutique »)
+   PAGE : ADMIN (onglets « Général », « Boutique » et « Badges »)
    ===================================================================== */
 const adminTabs = tab => `<div class="tabs">
   <a href="#/admin/general" class="${tab === 'general' ? 'on' : ''}">Général</a>
-  <a href="#/admin/boutique" class="${tab === 'boutique' ? 'on' : ''}">Boutique</a></div>`;
+  <a href="#/admin/boutique" class="${tab === 'boutique' ? 'on' : ''}">Boutique</a>
+  <a href="#/admin/badges" class="${tab === 'badges' ? 'on' : ''}">Badges</a></div>`;
+
+/* =====================================================================
+   ADMIN > BADGES : création, édition, activation, suppression des badges
+   ===================================================================== */
+async function adminBadges() {
+  let badges, ubRows, ridersAll;
+  try {
+    [badges, ubRows, ridersAll] = await Promise.all([
+      q(sb.from('badges').select('*').order('created_at', { ascending: false })),
+      fetchAll(() => sb.from('user_badges').select('badge_id').order('id')),
+      fetchAll(() => sb.from('riders').select('id,team,country').order('id')),
+    ]);
+  } catch (e) {
+    app.innerHTML = `<h1>Administration</h1>${adminTabs('badges')}
+      <div class="panel"><b class="error">Tables des badges introuvables.</b>
+      <p class="muted" style="margin:.4rem 0 0">Exécute migration_badges.sql dans Supabase (SQL Editor), puis recharge cette page. Détail : ${esc(e.message || e)}</p></div>`;
+    return;
+  }
+  const counts = new Map();
+  ubRows.forEach(u => counts.set(u.badge_id, (counts.get(u.badge_id) || 0) + 1));
+  const teams = [...new Set(ridersAll.map(r => r.team).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const baseCountries = [...new Set(ridersAll.map(r => r.country).filter(Boolean))];
+
+  app.innerHTML = `<h1>Administration</h1>${adminTabs('badges')}
+    <div class="panel"><h2>Badges et succès</h2>
+      <p class="muted">Les badges sont attribués automatiquement dès qu'un joueur remplit la condition (à chaque nouvelle carte obtenue, et à chaque connexion). Un badge obtenu n'est jamais retiré. Une équipe n'est comptée « complète » que si elle compte au moins ${TEAM_MIN} coureurs au catalogue.</p>
+      <p class="btnrow"><button class="btn primary" id="bNew">Créer un badge</button>
+        <button class="btn" id="bRecheck">Recalculer pour tous les joueurs</button></p>
+      <div class="table-wrap"><table><thead><tr><th>Badge</th><th>Condition</th><th class="num">Débloqué par</th><th>Statut</th><th></th></tr></thead>
+        <tbody id="bbody"></tbody></table></div></div>`;
+
+  const drawList = () => {
+    $('#bbody').innerHTML = badges.length ? badges.map(b => `<tr>
+        <td><div class="row" style="flex-wrap:nowrap"><span class="bicon-sm" style="display:inline-grid;place-items:center;width:38px;height:38px;border-radius:50%;background:var(--yellow);border:2px solid var(--ink);font-size:20px;overflow:hidden;flex:none">${badgeIcon(b)}</span>
+          <div><b>${esc(b.title)}</b><br><span class="muted">${esc(b.description)}</span></div></div></td>
+        <td>${esc(criteriaText(b))}<br><span class="muted">${esc(BADGE_TYPES[b.criteria_type] || b.criteria_type)}</span></td>
+        <td class="num">${counts.get(b.id) || 0}</td>
+        <td><span class="pill ${b.is_active ? 'open' : ''}">${b.is_active ? 'Actif' : 'Désactivé'}</span></td>
+        <td class="act">
+          <button class="btn small" data-bedit="${b.id}">Éditer</button>
+          <button class="btn small" data-btoggle="${b.id}">${b.is_active ? 'Désactiver' : 'Activer'}</button>
+          <button class="btn small danger" data-bdel="${b.id}">Supprimer</button></td></tr>`).join('')
+      : '<tr><td colspan="5" class="muted">Aucun badge pour le moment.</td></tr>';
+  };
+  const reload = async () => {
+    [badges, ubRows] = await Promise.all([
+      q(sb.from('badges').select('*').order('created_at', { ascending: false })),
+      fetchAll(() => sb.from('user_badges').select('badge_id').order('id')),
+    ]);
+    counts.clear();
+    ubRows.forEach(u => counts.set(u.badge_id, (counts.get(u.badge_id) || 0) + 1));
+    drawList();
+  };
+
+  /* Création / édition d'un badge (b = null pour une création) */
+  const editBadge = b => {
+    const countries = [...new Set([...baseCountries, ...(b?.criteria_type === 'nation' && b.criteria_target ? [b.criteria_target] : [])])]
+      .sort((x, y) => countryName(x).localeCompare(countryName(y)));
+    let curTarget = b?.criteria_target || '';
+    const m = openModal(`<h3>${b ? 'Modifier' : 'Créer'} un badge</h3>
+      <form id="bf" class="rform">
+        <label>Titre<input name="title" required maxlength="60" value="${esc(b?.title || '')}"></label>
+        <label>Description (200 caractères maximum)<textarea name="desc" maxlength="200" style="min-height:60px">${esc(b?.description || '')}</textarea></label>
+        <div class="formgrid">
+          <label>Icône (emoji)<input name="icon" maxlength="8" value="${esc(b?.icon || '🏅')}"></label>
+          <label>Image (optionnel : https://… ou img/badges/…)<input name="iconurl" maxlength="500" placeholder="img/badges/mon-badge.png" value="${esc(b?.icon_url || '')}"></label>
+        </div>
+        <label>Type de tâche<select name="type">${Object.entries(BADGE_TYPES).map(([k, l]) => `<option value="${k}" ${b?.criteria_type === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+        <div id="tgt"></div>
+        <label>Quantité requise<input name="value" type="number" min="1" max="100000" step="1" required value="${b ? b.criteria_value : 10}"></label>
+        <p class="muted" id="vhint" style="margin:0"></p>
+        <p id="berr" class="error" role="alert"></p>
+        <div class="row"><button type="button" class="btn" data-x>Annuler</button><button type="submit" class="btn primary">${b ? 'Enregistrer' : 'Créer le badge'}</button></div>
+      </form>`);
+    const f = $('#bf', m.box);
+
+    const updateValue = () => {
+      const type = f.elements['type'].value;
+      const v = f.elements['value'];
+      const fixed = type === 'team_complete' && curTarget !== '';
+      v.disabled = fixed;
+      if (fixed) v.value = 1;
+      $('#vhint', m.box).textContent = {
+        cards_total: 'Nombre total de cartes possédées, doublons compris.',
+        riders_distinct: 'Nombre de coureurs différents possédés.',
+        nation: 'Nombre de coureurs différents de cette nation.',
+        rarity: 'Nombre de coureurs différents de cette rareté.',
+        team_complete: fixed
+          ? 'Le classeur de cette équipe doit être complet à 100 %.'
+          : `Nombre d'équipes complètes à 100 % (équipes d'au moins ${TEAM_MIN} coureurs).`,
+      }[type] || '';
+    };
+    const renderTarget = () => {
+      const type = f.elements['type'].value;
+      let html = '';
+      if (type === 'nation') {
+        html = countries.length
+          ? `<label>Nation<select name="target">${countries.map(c => `<option value="${esc(c)}" ${c === curTarget ? 'selected' : ''}>${flag(c)} ${esc(countryName(c))}</option>`).join('')}</select></label>`
+          : '<p class="error">Aucun coureur avec un pays dans le catalogue.</p>';
+      } else if (type === 'rarity') {
+        html = `<label>Rareté<select name="target">${RARITY_ORDER.map(r => `<option value="${r}" ${r === curTarget ? 'selected' : ''}>${RARITY[r].label}</option>`).join('')}</select></label>`;
+      } else if (type === 'team_complete') {
+        html = `<label>Équipe<select name="target"><option value="">N'importe quelle équipe (compter les équipes complètes)</option>${teams.map(t => `<option value="${esc(t)}" ${t === curTarget ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>`;
+      }
+      $('#tgt', m.box).innerHTML = html;
+      const sel = f.elements['target'];
+      if (sel) { curTarget = sel.value; sel.onchange = () => { curTarget = sel.value; updateValue(); }; }
+      else curTarget = '';
+      updateValue();
+    };
+    f.elements['type'].onchange = () => { curTarget = ''; renderTarget(); };
+    renderTarget();
+    $('[data-x]', m.box).onclick = m.close;
+
+    f.onsubmit = async e => {
+      e.preventDefault();
+      const err = $('#berr', m.box); err.textContent = '';
+      const title = f.elements['title'].value.trim().replace(/\s+/g, ' ');
+      if (!title) { err.textContent = 'Le titre est obligatoire.'; return; }
+      const type = f.elements['type'].value;
+      let target = '';
+      if (type === 'nation' || type === 'rarity' || type === 'team_complete') target = f.elements['target'] ? f.elements['target'].value : '';
+      if ((type === 'nation' || type === 'rarity') && !target) { err.textContent = 'Choisis une cible pour ce type de tâche.'; return; }
+      const fixed = type === 'team_complete' && target !== '';
+      const value = fixed ? 1 : Number(f.elements['value'].value);
+      if (!Number.isInteger(value) || value < 1 || value > 100000) { err.textContent = 'Quantité invalide (entier de 1 à 100 000).'; return; }
+      const iconUrl = f.elements['iconurl'].value.trim();
+      if (iconUrl && !/^(https:\/\/|img\/)/.test(iconUrl)) { err.textContent = 'L\'image doit commencer par https:// ou img/.'; return; }
+      const payload = {
+        title,
+        description: f.elements['desc'].value.trim(),
+        icon: f.elements['icon'].value.trim() || '🏅',
+        icon_url: iconUrl || null,
+        criteria_type: type,
+        criteria_target: target,
+        criteria_value: value,
+        is_active: b ? b.is_active : true,
+      };
+      const btn = $('[type="submit"]', f); btn.disabled = true;
+      const { error } = b
+        ? await sb.from('badges').update(payload).eq('id', b.id)
+        : await sb.from('badges').insert(payload);
+      btn.disabled = false;
+      if (error) {
+        err.textContent = /duplicate|unique/i.test(error.message) ? 'Un badge porte déjà ce titre.' : error.message;
+        return;
+      }
+      m.close();
+      const r = await rpc('admin_recheck_badges');
+      toast(b ? 'Badge modifié.' : 'Badge créé.' + (r.ok ? ` ${r.data} attribution${r.data > 1 ? 's' : ''} immédiate${r.data > 1 ? 's' : ''}.` : ''), 'ok');
+      reload();
+    };
+  };
+
+  $('#bNew').onclick = () => editBadge(null);
+  $('#bRecheck').onclick = async () => {
+    const btn = $('#bRecheck'); btn.disabled = true;
+    const r = await rpc('admin_recheck_badges');
+    btn.disabled = false;
+    if (r.ok) { toast(`${r.data} nouvelle${r.data > 1 ? 's' : ''} attribution${r.data > 1 ? 's' : ''}.`, 'ok'); reload(); }
+  };
+  $('#bbody').onclick = async e => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    const id = btn.dataset.bedit || btn.dataset.btoggle || btn.dataset.bdel;
+    const b = badges.find(x => x.id === id);
+    if (!b) return;
+    if (btn.dataset.bedit) return editBadge(b);
+    if (btn.dataset.btoggle) {
+      const { error } = await sb.from('badges').update({ is_active: !b.is_active }).eq('id', b.id);
+      if (error) return toast(error.message, 'error');
+      toast(b.is_active ? 'Badge désactivé.' : 'Badge activé.', 'ok');
+      if (!b.is_active) await rpc('admin_recheck_badges');
+      return reload();
+    }
+    if (btn.dataset.bdel) {
+      const n = counts.get(b.id) || 0;
+      if (!await confirmBox(`Supprimer définitivement le badge « ${b.title} » ?${n ? ` Il disparaîtra aussi des ${n} joueur${n > 1 ? 's' : ''} qui l'ont obtenu.` : ''}`, 'Supprimer')) return;
+      const { error } = await sb.from('badges').delete().eq('id', b.id);
+      if (error) return toast(error.message, 'error');
+      toast('Badge supprimé.', 'ok');
+      reload();
+    }
+  };
+
+  drawList();
+}
 
 /* =====================================================================
    ADMIN > BOUTIQUE : cartes en vente directe et boosters éphémères
@@ -1918,6 +2459,7 @@ async function adminShop() {
 async function pageAdmin(tab = 'general') {
   if (!state.profile.is_admin) { app.innerHTML = '<p class="error">Accès réservé.</p>'; return; }
   if (tab === 'boutique') return adminShop();
+  if (tab === 'badges') return adminBadges();
 
   const [races, ridersInit, playersInit] = await Promise.all([
     q(sb.from('races').select('*').eq('status', 'upcoming').order('start_at')),
