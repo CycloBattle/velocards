@@ -33,26 +33,46 @@ const CAPTAIN_TOP = 10;   // ...uniquement s'il termine dans le Top 10 réel
 const MYTHIC_BONUS = 40;  // bonus fixe des cartes mythiques (coureurs retraités)
 const TEAM_SIZE = 8;
 
+/* Prestige des courses : coefficient appliqué à tous les points.
+   À garder aligné avec race_multiplier() dans migration_prestige.sql. */
+const TIERS = {
+  1: { label: 'Tier 1', long: 'Grands Tours & Monuments', mult: 2 },
+  2: { label: 'Tier 2', long: 'WorldTour', mult: 1.5 },
+  3: { label: 'Tier 3', long: 'ProSeries / Europe Tour', mult: 1 },
+};
+const tierOf = r => (TIERS[r?.tier_level] ? r.tier_level : 3);
+const courseMult = r => TIERS[tierOf(r)].mult;
+const fmtMult = m => `×${String(m).replace('.', ',')}`;
+function tierBadge(r, { long = false } = {}) {
+  const t = tierOf(r);
+  return `<span class="tier t${t}" title="${esc(TIERS[t].long)} : points ${fmtMult(TIERS[t].mult)}">${t === 1 ? '★ ' : ''}${TIERS[t].label}${long ? ' · ' + esc(TIERS[t].long) : ''} · ${fmtMult(TIERS[t].mult)}</span>`;
+}
+
+/* Arrondi à l'entier inférieur, insensible aux petites erreurs de virgule flottante */
+const flo = x => Math.floor(x + 1e-9);
+
 /* Points de base d'une place (0 si hors du Top 30 ou place inconnue) */
 function basePoints(pos) {
   return Number.isInteger(pos) && pos >= 1 && pos <= MAX_POSITION ? POSITION_POINTS[pos - 1] : 0;
 }
 
-/* Points d'une carte selon sa rareté, la place réelle du coureur et le statut de capitaine.
+/* Points d'une carte : base x rareté x capitaine (x2 si Top 10) x coefficient de la course.
+   Carte mythique : bonus fixe x coefficient de la course.
    Doit rester identique à la fonction SQL validate_race. */
-function cardPoints(rarity, pos, isCaptain = false) {
-  if (rarity === 'mythic') return MYTHIC_BONUS;
+function cardPoints(rarity, pos, isCaptain = false, course = 1) {
+  if (rarity === 'mythic') return flo(MYTHIC_BONUS * course);
   const base = basePoints(pos);
   const cap = isCaptain && Number.isInteger(pos) && pos >= 1 && pos <= CAPTAIN_TOP ? CAPTAIN_MULT : 1;
-  return Math.floor(base * (RARITY[rarity]?.mult ?? 1) * cap);
+  return flo(base * (RARITY[rarity]?.mult ?? 1) * cap * course);
 }
 
 /* Calculateur du score d'une équipe à partir des résultats réels.
-   - riders    : tableau de { id, rarity } (les 8 coureurs alignés)
+   - riders    : tableau de { id, rarity } (les coureurs alignés)
    - captainId : id du coureur capitaine (ou null)
    - results   : tableau de { pos, rider_id } (classement réel enregistré en base)
-   Renvoie { cards: [{ rider_id, pos, base, mult, isCaptain, captainApplied, points }], total } */
-function computeTeamScore(riders, captainId, results) {
+   - course    : coefficient de la course (1, 1.5 ou 2)
+   Renvoie { cards: [{ rider_id, pos, base, mult, isCaptain, captainApplied, course, points }], total } */
+function computeTeamScore(riders, captainId, results, course = 1) {
   const posByRider = new Map(results.map(r => [r.rider_id, r.pos]));
   const cards = riders.map(r => {
     const pos = posByRider.has(r.id) ? posByRider.get(r.id) : null;
@@ -67,7 +87,8 @@ function computeTeamScore(riders, captainId, results) {
       mult: RARITY[r.rarity]?.mult ?? 1,
       isCaptain,
       captainApplied,
-      points: cardPoints(r.rarity, pos, isCaptain),
+      course,
+      points: cardPoints(r.rarity, pos, isCaptain, course),
     };
   });
   return { cards, total: cards.reduce((s, c) => s + c.points, 0) };
@@ -458,11 +479,16 @@ async function lockInfo() {
   };
 }
 
+/* Pseudos à partir d'identifiants (par paquets de 80 pour garder des adresses de requête courtes) */
 async function usernames(ids) {
   const uniq = [...new Set(ids.filter(Boolean))];
   if (!uniq.length) return {};
-  const rows = await q(sb.from('public_profiles').select('id,username').in('id', uniq));
-  return Object.fromEntries(rows.map(r => [r.id, r.username]));
+  const out = {};
+  for (let i = 0; i < uniq.length; i += 80) {
+    const rows = await q(sb.from('public_profiles').select('id,username').in('id', uniq.slice(i, i + 80)));
+    rows.forEach(r => { out[r.id] = r.username; });
+  }
+  return out;
 }
 
 /* Grille de collection avec filtres (utilisée par « Collection » et « Profil »).
@@ -1216,7 +1242,8 @@ async function pageShowcase() {
 /* =====================================================================
    PAGE : ÉQUIPE (courses d'un jour)
    Le joueur choisit seulement ses 8 cartes et son capitaine.
-   Les points sont calculés automatiquement à la validation de la course.
+   Les points sont calculés automatiquement à la validation de la course :
+   base x rareté x capitaine x coefficient de prestige de la course.
    ===================================================================== */
 function raceState(r) {
   const now = Date.now(), s = +new Date(r.start_at);
@@ -1227,40 +1254,172 @@ function raceState(r) {
 }
 const STATE_LABEL = { soon: 'Bientôt', open: 'Ouverte', locked: 'Verrouillée', finished: 'Terminée' };
 
+/* ---------- Rapport de course : détail carte par carte ----------
+   lineup  : { captain_rider_id, points, coins_earned, lineup_cards: [{ rider_id, points?, riders }] }
+   riderMap: Map rider_id -> coureur
+   results : [{ pos, rider_id }] (classement réel enregistré en base)
+   Les points stockés à la validation font foi ; à défaut, ils sont recalculés. */
+function buildReport(race, lineup, riderMap, results) {
+  const lcs = lineup.lineup_cards || [];
+  const riders = lcs.map(lc => riderMap.get(lc.rider_id)).filter(Boolean);
+  const sc = computeTeamScore(riders, lineup.captain_rider_id, results, courseMult(race));
+  const stored = new Map(lcs.map(lc => [lc.rider_id, lc.points]));
+  const cards = sc.cards.map(c => {
+    const st = stored.get(c.rider_id);
+    return { ...c, rider: riderMap.get(c.rider_id), points: st ?? c.points };
+  });
+  return {
+    cards,
+    total: lineup.points,
+    coins: lineup.coins_earned,
+    sum: cards.reduce((s, c) => s + c.points, 0),
+  };
+}
+
+/* Bloc de rapport : synthèse, MVP et tableau « base × rareté × capitaine × course = total » */
+function raceReportHTML(race, report) {
+  const cm = courseMult(race);
+  const sorted = [...report.cards].sort((a, b) => b.points - a.points || (a.pos ?? 99) - (b.pos ?? 99));
+  const best = sorted[0] && sorted[0].points > 0 ? sorted[0] : null;
+  const bestName = best?.rider?.name || '?';
+  return `<div class="stat-row">
+      <div class="stat"><b>${report.total}</b><span>points (+${report.coins} pièces)</span></div>
+      <div class="stat"><b>${fmtMult(cm)}</b><span>coefficient de la course (${esc(TIERS[tierOf(race)].label)})</span></div>
+      ${best ? `<div class="mvp-box"><b>🏆 MVP de l'équipe</b><br>${esc(bestName)} : ${best.points} points</div>` : ''}
+    </div>
+    <div class="table-wrap"><table class="rtable">
+      <thead><tr><th>Coureur</th><th class="num">Place réelle</th><th class="num">Points de base</th><th>× Rareté</th><th>× Capitaine</th><th>× Course</th><th class="num">= Total</th></tr></thead>
+      <tbody>${sorted.map(c => {
+        const r = c.rider || { name: '?', rarity: 'common' };
+        const isMvp = best && c.rider_id === best.rider_id;
+        return `<tr class="${isMvp ? 'mvp' : ''}">
+          <td>${esc(r.name)}${c.isCaptain ? ' <span class="captain-mark">★ Capitaine</span>' : ''}${isMvp ? '<span class="mvp-tag">🏆 MVP</span>' : ''}
+            <span class="rar-note">${RARITY[r.rarity]?.label || ''}</span></td>
+          <td class="num">${c.mythic ? '–' : c.pos === null ? 'hors Top ' + MAX_POSITION : ordinal(c.pos)}</td>
+          <td class="num">${c.mythic ? MYTHIC_BONUS + ' (bonus)' : c.base}</td>
+          <td class="mul">${c.mythic ? '–' : fmtMult(c.mult)}</td>
+          <td class="mul">${c.isCaptain ? (c.captainApplied ? fmtMult(CAPTAIN_MULT) : '×1 (hors Top ' + CAPTAIN_TOP + ')') : '–'}</td>
+          <td class="mul">${fmtMult(c.course)}</td>
+          <td class="tot">= ${c.points}</td></tr>`;
+      }).join('')}</tbody>
+    </table></div>
+    ${report.sum !== report.total ? `<p class="muted" style="margin:.8rem 0 0">Le total officiel (${report.total}) fait foi : il a été calculé au moment de la validation de la course.</p>` : ''}`;
+}
+
+/* Fenêtre « rapport de fin de course » (RaceSummaryModal) */
+function showRaceSummary(race, report, title) {
+  const m = openModal(`<h2>${esc(title || 'Rapport de course')}</h2>
+    <p class="muted">${esc(race.name)} · ${tierBadge(race, { long: true })}</p>
+    ${raceReportHTML(race, report)}
+    <div class="row"><button class="btn primary" data-x>Fermer</button></div>`, { wide: true });
+  $('[data-x]', m.box).onclick = m.close;
+}
+
+/* Fenêtre « équipe d'un concurrent » (CompetitorsLineupsModal) : cartes, capitaine, détail des points après la course */
+async function showCompetitorLineup(race, entry, username, results) {
+  let lcs;
+  try {
+    lcs = await q(sb.from('lineup_cards').select('rider_id,points,riders(*)').eq('lineup_id', entry.id));
+  } catch (e) {
+    try { lcs = await q(sb.from('lineup_cards').select('rider_id,riders(*)').eq('lineup_id', entry.id)); }
+    catch (e2) { return toast(e2.message || 'Équipe illisible.', 'error'); }
+  }
+  lcs = lcs.filter(l => l.riders);
+  const finished = raceState(race) === 'finished';
+  const riderMap = new Map(lcs.map(l => [l.rider_id, l.riders]));
+  const lineup = { captain_rider_id: entry.captain_rider_id, points: entry.points, coins_earned: entry.coins_earned, lineup_cards: lcs };
+  const report = finished ? buildReport(race, lineup, riderMap, results) : null;
+  const ptsOf = id => report?.cards.find(c => c.rider_id === id)?.points;
+  const ordered = [...lcs].sort((a, b) =>
+    (b.rider_id === entry.captain_rider_id ? 1 : 0) - (a.rider_id === entry.captain_rider_id ? 1 : 0)
+    || rarityIdx(b.riders.rarity) - rarityIdx(a.riders.rarity) || a.riders.name.localeCompare(b.riders.name));
+
+  const m = openModal(`<h2>Équipe de ${esc(username)}</h2>
+    <p class="muted">${esc(race.name)} · ${tierBadge(race)}${finished ? ` · ${entry.points} points` : ''}</p>
+    ${lcs.length ? `<div class="comp-grid">${ordered.map(l => {
+      const cap = l.rider_id === entry.captain_rider_id;
+      const pts = ptsOf(l.rider_id);
+      return `<div class="card-wrap">${cardHTML(l.riders, { cls: 'pick', attrs: `data-rid="${l.rider_id}" tabindex="0"` })}
+        <div class="cmark">${cap ? '<span class="captain-mark">★ Capitaine</span>' : ''}${pts !== undefined ? `<b>${pts} pts</b>` : ''}</div></div>`;
+    }).join('')}</div>` : '<p class="muted">Composition indisponible.</p>'}
+    ${report ? `<h3>Détail des points</h3>${raceReportHTML(race, report)}` : ''}
+    <div class="row"><button class="btn primary" data-x>Fermer</button></div>`, { wide: true });
+  $('[data-x]', m.box).onclick = m.close;
+  const open = el => {
+    const c = el.closest('[data-rid]');
+    if (!c) return;
+    const r = riderMap.get(+c.dataset.rid);
+    if (r) showRiderDetail(r);
+  };
+  m.box.onclick = e => open(e.target);
+  m.box.onkeydown = e => { if (e.key === 'Enter') open(e.target); };
+}
+
 async function pageTeam(raceId) {
   if (raceId) return composer(+raceId);
-  const [races, mine, done] = await Promise.all([
+  const [races, mine, doneRaces] = await Promise.all([
     q(sb.from('races').select('*').eq('status', 'upcoming').order('start_at')),
-    q(sb.from('lineups').select('race_id').eq('user_id', state.uid)),
-    q(sb.from('lineups').select('race_id,points,coins_earned,races!inner(id,name,start_at,category,status)').eq('user_id', state.uid).eq('races.status', 'finished')),
+    q(sb.from('lineups').select('race_id,points,coins_earned').eq('user_id', state.uid)),
+    q(sb.from('races').select('*').eq('status', 'finished').order('start_at', { ascending: false }).limit(40)),
   ]);
-  const has = new Set(mine.map(m => m.race_id));
-  done.sort((a, b) => +new Date(b.races.start_at) - +new Date(a.races.start_at));
+  const mineMap = new Map(mine.map(m => [m.race_id, m]));
   app.innerHTML = `<h1>Équipe</h1>
-    <p class="lead">Compose ton équipe de ${TEAM_SIZE} coureurs à partir de 5 jours avant le départ, et choisis un capitaine. Elle se verrouille au départ de la vraie course. Ensuite, tes points sont calculés automatiquement d'après le classement réel : les ${MAX_POSITION} premiers rapportent des points, et ton capitaine compte double s'il finit dans le Top ${CAPTAIN_TOP}.</p>
+    <p class="lead">Compose ton équipe de ${TEAM_SIZE} coureurs à partir de 5 jours avant le départ, et choisis un capitaine. Elle se verrouille au départ de la vraie course. Ensuite, tes points sont calculés automatiquement d'après le classement réel : les ${MAX_POSITION} premiers rapportent des points, ton capitaine compte double s'il finit dans le Top ${CAPTAIN_TOP}, et le prestige de la course multiplie le tout (Tier 1 ${fmtMult(2)}, Tier 2 ${fmtMult(1.5)}, Tier 3 ${fmtMult(1)}).</p>
     <div class="race-list">${races.length ? races.map(r => {
       const s = raceState(r);
-      return `<a class="panel race-item" href="#/equipe/${r.id}" style="text-decoration:none">
+      return `<a class="panel race-item t${tierOf(r)}" href="#/equipe/${r.id}" style="text-decoration:none">
         <div class="grow"><h3>${esc(r.name)}</h3><span class="muted">${fmtDate(r.start_at)} ${r.category ? '(' + esc(r.category) + ')' : ''}</span></div>
-        ${has.has(r.id) ? '<span class="pill">Équipe enregistrée</span>' : ''}
+        ${tierBadge(r)}
+        ${mineMap.has(r.id) ? '<span class="pill">Équipe enregistrée</span>' : ''}
         <span class="pill ${s}">${STATE_LABEL[s]}</span></a>`;
     }).join('') : '<div class="panel"><p>Aucune course à venir pour le moment.</p></div>'}</div>
-    ${done.length ? `<h2 style="margin-top:2rem">Mes courses terminées</h2>
-    <div class="race-list">${done.map(d => `<a class="panel race-item" href="#/equipe/${d.races.id}" style="text-decoration:none">
-        <div class="grow"><h3>${esc(d.races.name)}</h3><span class="muted">${fmtDate(d.races.start_at)} ${d.races.category ? '(' + esc(d.races.category) + ')' : ''}</span></div>
-        <b>${d.points} pts (+${d.coins_earned} 🪙)</b>
-        <span class="pill finished">${STATE_LABEL.finished}</span></a>`).join('')}</div>` : ''}`;
+    ${doneRaces.length ? `<h2 style="margin-top:2rem">Courses terminées</h2>
+    <div class="race-list">${doneRaces.map(r => {
+      const d = mineMap.get(r.id);
+      return `<a class="panel race-item t${tierOf(r)}" href="#/equipe/${r.id}" style="text-decoration:none">
+        <div class="grow"><h3>${esc(r.name)}</h3><span class="muted">${fmtDate(r.start_at)} ${r.category ? '(' + esc(r.category) + ')' : ''}</span></div>
+        ${tierBadge(r)}
+        ${d ? `<b>${d.points} pts (+${d.coins_earned} 🪙)</b>` : '<span class="muted">Pas d\'équipe</span>'}
+        <span class="pill finished">${STATE_LABEL.finished}</span></a>`;
+    }).join('')}</div>` : ''}`;
 }
 
 async function composer(raceId) {
   const race = await q(sb.from('races').select('*').eq('id', raceId).single());
   const st = raceState(race);
   const editable = st === 'open';
-  const [cards, lk, lineup, results] = await Promise.all([
+  const cm = courseMult(race);
+  const finishedRace = st === 'finished';
+
+  const lineupCols = withPoints => `id,captain_rider_id,points,coins_earned,lineup_cards(user_card_id,rider_id,${withPoints ? 'points,' : ''}riders(*))`;
+  const getLineup = withPoints => q(sb.from('lineups').select(lineupCols(withPoints)).eq('race_id', raceId).eq('user_id', state.uid).maybeSingle());
+
+  const [cards, lk, resRows, official] = await Promise.all([
     myCards(), lockInfo(),
-    q(sb.from('lineups').select('id,captain_rider_id,points,coins_earned,lineup_cards(user_card_id,rider_id,riders(*))').eq('race_id', raceId).eq('user_id', state.uid).maybeSingle()),
-    st === 'finished' ? q(sb.from('race_results').select('pos,rider_id').eq('race_id', raceId).order('pos')) : Promise.resolve([]),
+    finishedRace
+      ? q(sb.from('race_results').select('pos,rider_id,riders(id,name,team,country,rarity)').eq('race_id', raceId).order('pos'))
+      : Promise.resolve([]),
+    finishedRace
+      ? q(sb.from('race_official_results').select('pos,rider_name,rider_id,riders(id,name,team,country,rarity)').eq('race_id', raceId).order('pos')).catch(() => [])
+      : Promise.resolve([]),
   ]);
+  let lineup;
+  try { lineup = await getLineup(true); } catch (e) { lineup = await getLineup(false); }
+  const results = resRows.map(r => ({ pos: r.pos, rider_id: r.rider_id }));
+
+  /* Concurrents : visibles seulement à partir du départ de la course */
+  let comps = [], compNames = {};
+  if (st === 'locked' || st === 'finished') {
+    try {
+      comps = await q(sb.from('lineups').select('id,user_id,captain_rider_id,points,coins_earned').eq('race_id', raceId).order('points', { ascending: false }).limit(500));
+      compNames = await usernames(comps.map(c => c.user_id));
+      comps.sort((a, b) => st === 'finished'
+        ? b.points - a.points || (compNames[a.user_id] || '').localeCompare(compNames[b.user_id] || '')
+        : (compNames[a.user_id] || '').localeCompare(compNames[b.user_id] || ''));
+    } catch (e) { comps = []; }
+  }
+  const rankOf = new Map(comps.map((c, i) => [c.id, i + 1]));
+
   const groups = groupByRider(cards)
     .map(g => ({ ...g, free: g.cards.filter(c => !lk.listed.has(c.id)) }))
     .filter(g => g.free.length);
@@ -1280,58 +1439,75 @@ async function composer(raceId) {
     for (const lc of lineup?.lineup_cards || []) sel.set(lc.rider_id, lc.user_card_id);
   }
 
-  /* Score réel (course terminée) : calculé à partir des résultats enregistrés en base */
-  const score = st === 'finished' && lineup
-    ? computeTeamScore([...sel.keys()].map(rid => riderOf(rid)), captain, results)
-    : null;
-  const scoreOf = rid => score?.cards.find(c => c.rider_id === rid);
+  /* Rapport de la course terminée : points enregistrés à la validation, carte par carte */
+  const report = finishedRace && lineup ? buildReport(race, lineup, lineupRiders, results) : null;
+  const scoreOf = rid => report?.cards.find(c => c.rider_id === rid);
 
-  let resultPanel = '';
-  if (st === 'finished') {
-    if (!lineup) {
-      resultPanel = `<div class="panel">Tu n'avais pas aligné d'équipe sur cette course.</div>`;
-    } else {
-      const sorted = [...score.cards].sort((a, b) => b.points - a.points);
-      const diff = score.total !== lineup.points;
-      resultPanel = `<div class="panel">
-        <h2 style="margin-top:0">Résultat de ton équipe</h2>
-        <div class="stat-row">
-          <div class="stat"><b>${lineup.points}</b><span>points (+${lineup.coins_earned} pièces)</span></div>
-        </div>
-        <div class="table-wrap"><table><thead><tr><th>Coureur</th><th>Rareté</th><th class="num">Place réelle</th><th>Calcul</th><th class="num">Points</th></tr></thead><tbody>
-        ${sorted.map(c => {
-          const r = riderOf(c.rider_id);
-          let calc;
-          if (c.mythic) calc = `bonus fixe ${MYTHIC_BONUS}`;
-          else if (c.pos === null || c.pos > MAX_POSITION) calc = 'hors Top ' + MAX_POSITION;
-          else calc = `${c.base} × ${c.mult}${c.captainApplied ? ' × ' + CAPTAIN_MULT + ' (capitaine)' : ''}`;
-          return `<tr><td>${esc(r.name)}${c.isCaptain ? ' <span class="captain-mark">★ Capitaine</span>' : ''}</td>
-            <td>${RARITY[r.rarity].label}</td>
-            <td class="num">${c.mythic ? '–' : (c.pos === null ? 'hors résultats' : c.pos)}</td>
-            <td class="muted">${calc}</td>
-            <td class="num"><b>${c.points}</b></td></tr>`;
-        }).join('')}
-        </tbody></table></div>
-        ${diff ? `<p class="muted" style="margin:.8rem 0 0">Le total officiel (${lineup.points}) fait foi : il a été calculé au moment de la validation de la course.</p>` : ''}
-      </div>`;
-    }
+  let resultPanel = '', top30Panel = '';
+  if (finishedRace) {
+    resultPanel = !lineup
+      ? `<div class="panel">Tu n'avais pas aligné d'équipe sur cette course.</div>`
+      : `<div class="panel">
+          <div class="row"><h2 class="grow" style="margin:0">Rapport de ta course</h2><button class="btn small" id="repBtn">Ouvrir dans une fenêtre</button></div>
+          ${raceReportHTML(race, report)}
+        </div>`;
+
+    const myIds = new Set((lineup?.lineup_cards || []).map(l => l.rider_id));
+    const rows30 = official.length
+      ? official.map(o => ({ pos: o.pos, name: o.rider_name, rider: o.riders }))
+      : resRows.map(o => ({ pos: o.pos, name: o.riders?.name || '?', rider: o.riders }));
+    top30Panel = `<div class="panel">
+      <h2 style="margin-top:0">Classement officiel de la course</h2>
+      <p class="muted">Les ${MAX_POSITION} premiers rapportent des points. « Pts de course » = points de base × coefficient de la course (${fmtMult(cm)}), avant bonus de rareté et de capitaine.${official.length ? '' : ' Course validée avant la mise à jour : seuls les coureurs du jeu sont listés.'}</p>
+      ${rows30.length ? `<div class="table-wrap"><table class="top30">
+        <thead><tr><th class="num">Place</th><th>Coureur</th><th>Équipe</th><th class="num">Points de base</th><th class="num">Pts de course</th></tr></thead>
+        <tbody>${rows30.map(o => `<tr class="${o.pos <= 3 ? 'p' + o.pos : ''} ${o.rider && myIds.has(o.rider.id) ? 'mine' : ''}">
+          <td class="num">${o.pos}</td>
+          <td>${o.rider ? flag(o.rider.country) + ' ' : ''}${esc(o.name)}${o.rider ? ' <span class="pill">carte du jeu</span>' : ''}</td>
+          <td>${esc(o.rider?.team || '–')}</td>
+          <td class="num">${basePoints(o.pos)}</td>
+          <td class="num"><b>${flo(basePoints(o.pos) * cm)}</b></td></tr>`).join('')}</tbody>
+      </table></div>` : '<p class="muted">Classement indisponible.</p>'}
+    </div>`;
+  }
+
+  /* Compositions des concurrents */
+  let compPanel = '';
+  if (st === 'locked' || st === 'finished') {
+    compPanel = `<div class="panel">
+      <h2 style="margin-top:0">Compositions des concurrents</h2>
+      <p class="muted">${comps.length
+        ? `${comps.length} équipe${comps.length > 1 ? 's' : ''} alignée${comps.length > 1 ? 's' : ''}. Clique sur « Voir » pour découvrir les ${TEAM_SIZE} cartes et le capitaine d'un joueur.`
+        : 'Personne n\'a aligné d\'équipe sur cette course.'}</p>
+      ${comps.length ? `<label>Rechercher un joueur<input id="cq" placeholder="Pseudo" autocomplete="off" style="max-width:260px"></label>
+        <div class="table-wrap" style="margin-top:.6rem"><table>
+          <thead><tr>${finishedRace ? '<th class="num">#</th>' : ''}<th>Joueur</th>${finishedRace ? '<th class="num">Points</th><th class="num">Pièces</th>' : ''}<th></th></tr></thead>
+          <tbody id="cbody"></tbody></table></div>
+        <p style="margin:.8rem 0 0"><button class="btn small" id="cmore" hidden>Afficher plus</button></p>` : ''}
+    </div>`;
+  } else {
+    compPanel = `<div class="panel muted">Les compositions des concurrents seront visibles dès le départ de la course : elles restent secrètes d'ici là, pour que personne ne puisse copier une équipe.</div>`;
   }
 
   app.innerHTML = `<p><a href="#/equipe">← Toutes les courses</a></p>
     <h1>${esc(race.name)}</h1>
-    <p class="lead">${fmtDate(race.start_at)} <span class="pill ${st}">${STATE_LABEL[st]}</span></p>
+    <p class="lead">${fmtDate(race.start_at)} ${race.category ? '(' + esc(race.category) + ') ' : ''}<span class="pill ${st}">${STATE_LABEL[st]}</span></p>
+    <div class="panel prestige-note">${tierBadge(race, { long: true })}
+      <span class="muted">${cm === 1 ? 'Barème standard : les points ne sont pas majorés.' : `Course de prestige : tous les points de cette course sont multipliés par ${fmtMult(cm)}.`}</span></div>
     ${st === 'soon' ? `<div class="panel">Les équipes ouvrent le ${fmtDate(new Date(+new Date(race.start_at) - 5 * 864e5))}.</div>` : ''}
     ${st === 'locked' ? `<div class="panel">La course a démarré : ton équipe est verrouillée. Les points seront calculés automatiquement dès la validation des résultats.</div>` : ''}
     ${resultPanel}
+    ${top30Panel}
     <div class="panel">
       <div class="row"><h2 class="grow" style="margin:0">Mon équipe <span id="cnt"></span></h2>
       ${editable ? '<button class="btn primary" id="save">Enregistrer l\'équipe</button>' : ''}</div>
       <div class="slots" id="slots"></div>
-      <p class="muted" style="margin:0">Le capitaine marque ×${CAPTAIN_MULT} s'il termine dans le Top ${CAPTAIN_TOP} réel (sinon, il compte comme une carte normale). Les points de chaque carte dépendent de la place réelle du coureur (Top ${MAX_POSITION}) et de sa rareté. 1 point = 1 pièce.</p>
+      <p class="muted" style="margin:0">Points d'une carte = points de base de la place réelle (Top ${MAX_POSITION}) × bonus de rareté × capitaine (×${CAPTAIN_MULT} s'il termine dans le Top ${CAPTAIN_TOP}) × coefficient de la course (${fmtMult(cm)}). 1 point = 1 pièce.</p>
     </div>
+    ${compPanel}
     <details class="panel">
       <summary><b>Voir le barème complet (1er au ${MAX_POSITION}e)</b></summary>
-      <p class="muted" style="margin-top:.6rem">Points de base, avant multiplicateur de rareté : ${RARITY_ORDER.map(r => `${RARITY[r].label} ×${RARITY[r].mult}`).join(', ')}. Les cartes mythiques vintage rapportent un bonus fixe de ${MYTHIC_BONUS} points.</p>
+      <p class="muted" style="margin-top:.6rem">Points de base, avant les multiplicateurs : bonus de rareté ${RARITY_ORDER.map(r => `${RARITY[r].label} ${fmtMult(RARITY[r].mult)}`).join(', ')} ; coefficient de la course ${Object.values(TIERS).map(t => `${t.label} ${fmtMult(t.mult)}`).join(', ')}. Les cartes mythiques vintage rapportent un bonus fixe de ${MYTHIC_BONUS} points, multiplié par le coefficient de la course.</p>
       ${baremeTable()}
     </details>
     ${editable ? `<h2>Ma collection</h2>
@@ -1341,6 +1517,39 @@ async function composer(raceId) {
     </div>
     <div class="cards" id="grid"></div>` : ''}`;
 
+  /* ----- Rapport en fenêtre ----- */
+  const repBtn = $('#repBtn');
+  if (repBtn && report) repBtn.onclick = () => showRaceSummary(race, report, 'Rapport de ta course');
+
+  /* ----- Compositions des concurrents ----- */
+  let cshown = 50;
+  const drawComps = () => {
+    const body = $('#cbody');
+    if (!body) return;
+    const fq = nameKey($('#cq').value);
+    const list = comps.filter(c => !fq || nameKey(compNames[c.user_id] || '').includes(fq));
+    const part = list.slice(0, cshown);
+    body.innerHTML = part.length ? part.map(c => `<tr class="${c.user_id === state.uid ? 'me' : ''}">
+        ${finishedRace ? `<td class="num">${rankOf.get(c.id)}</td>` : ''}
+        <td>${esc(compNames[c.user_id] || '?')}${c.user_id === state.uid ? ' (toi)' : ''}</td>
+        ${finishedRace ? `<td class="num">${c.points}</td><td class="num">+${c.coins_earned}</td>` : ''}
+        <td><button class="btn small" data-view="${c.id}">Voir</button></td></tr>`).join('')
+      : `<tr><td colspan="${finishedRace ? 5 : 2}" class="muted">Aucun joueur ne correspond.</td></tr>`;
+    $('#cmore').hidden = list.length <= cshown;
+  };
+  if ($('#cbody')) {
+    $('#cq').oninput = () => { cshown = 50; drawComps(); };
+    $('#cmore').onclick = () => { cshown += 50; drawComps(); };
+    $('#cbody').onclick = e => {
+      const b = e.target.closest('[data-view]');
+      if (!b) return;
+      const entry = comps.find(c => c.id === b.dataset.view);
+      if (entry) showCompetitorLineup(race, entry, compNames[entry.user_id] || 'Joueur', results);
+    };
+    drawComps();
+  }
+
+  /* ----- Mon équipe ----- */
   const drawSlots = () => {
     const ids = [...sel.keys()];
     $('#cnt').textContent = `(${ids.length}/${TEAM_SIZE})`;
@@ -1627,7 +1836,7 @@ async function pageWallet() {
     <h2 style="margin-top:1.5rem">Barème</h2>
     <div class="panel">
       <p>Les ${MAX_POSITION} premiers de chaque course rapportent des points de base : 1<sup>er</sup> : ${POSITION_POINTS[0]}, 2<sup>e</sup> : ${POSITION_POINTS[1]}, 3<sup>e</sup> : ${POSITION_POINTS[2]}, puis une baisse marquée jusqu'au 10<sup>e</sup> (${POSITION_POINTS[9]}) et plus douce jusqu'au ${MAX_POSITION}<sup>e</sup> (${POSITION_POINTS[MAX_POSITION - 1]}). Au-delà : 0.</p>
-      <p>Multiplicateur de rareté : ${RARITY_ORDER.map(r => `${RARITY[r].label} ×${RARITY[r].mult}`).join(', ')}. Capitaine ×${CAPTAIN_MULT} s'il termine dans le Top ${CAPTAIN_TOP}. Les cartes mythiques vintage (coureurs retraités) rapportent un bonus fixe de ${MYTHIC_BONUS} points à chaque course. 1 point = 1 pièce.</p>
+      <p>Multiplicateur de rareté : ${RARITY_ORDER.map(r => `${RARITY[r].label} ${fmtMult(RARITY[r].mult)}`).join(', ')}. Capitaine ${fmtMult(CAPTAIN_MULT)} s'il termine dans le Top ${CAPTAIN_TOP}. Coefficient de prestige de la course : ${Object.values(TIERS).map(t => `${t.label} (${t.long}) ${fmtMult(t.mult)}`).join(', ')}. Les cartes mythiques vintage (coureurs retraités) rapportent un bonus fixe de ${MYTHIC_BONUS} points, multiplié par le coefficient de la course. 1 point = 1 pièce.</p>
       <details><summary><b>Tableau complet</b></summary>${baremeTable()}</details>
     </div>`;
 
@@ -2473,12 +2682,15 @@ async function pageAdmin(tab = 'general') {
   let shown = 50;
   let picked = null;                 // joueur choisi pour le cadeau de boosters
   const rarityOptions = RARITY_ORDER.map(r => `<option value="${r}">${RARITY[r].label}</option>`).join('');
+  const raceOptionsHTML = () => races.length
+    ? races.map(r => `<option value="${r.id}">${esc(r.name)} (${fmtDate(r.start_at)}) · ${TIERS[tierOf(r)].label} ${fmtMult(courseMult(r))}</option>`).join('')
+    : '<option value="">Aucune course à venir</option>';
 
   app.innerHTML = `<h1>Administration</h1>${adminTabs('general')}
 
     <div class="panel"><h2>Validation de course</h2>
-      <p class="muted">1. Choisis la course et colle le lien de sa page de résultats sur firstcycling.com. 2. Clique sur « Récupérer les résultats de la course » et vérifie le Top ${MAX_POSITION} (tu peux corriger un nom). 3. Clique sur « Valider et calculer les scores » : les points et pièces sont crédités aux joueurs et la course passe en « Terminée ». Les coureurs absents de ton catalogue sont ignorés. Action définitive.</p>
-      <label>Course<select id="vr">${races.length ? races.map(r => `<option value="${r.id}">${esc(r.name)} (${fmtDate(r.start_at)})</option>`).join('') : '<option value="">Aucune course à venir</option>'}</select></label>
+      <p class="muted">1. Choisis la course et colle le lien de sa page de résultats sur firstcycling.com. 2. Clique sur « Récupérer les résultats de la course » et vérifie le Top ${MAX_POSITION} (tu peux corriger un nom). 3. Clique sur « Valider et calculer les scores » : les points (multipliés par le coefficient de prestige de la course) et les pièces sont crédités aux joueurs, le classement officiel est enregistré et la course passe en « Terminée ». Les coureurs absents de ton catalogue ne rapportent rien mais restent dans le classement affiché. Action définitive.</p>
+      <label>Course<select id="vr">${raceOptionsHTML()}</select></label>
       <label style="margin-top:.6rem">Lien de la page de résultats (firstcycling.com)<input id="vurl" type="url" placeholder="https://firstcycling.com/..." autocomplete="off"></label>
       <p style="margin-top:.8rem"><button class="btn" id="vFetch">Récupérer les résultats de la course</button></p>
       <p id="vStatus" class="muted" role="status"></p>
@@ -2490,6 +2702,14 @@ async function pageAdmin(tab = 'general') {
       <div id="vTable" class="table-wrap" style="margin-top:.8rem"></div>
       <p id="vSummary" class="muted" style="margin-top:.6rem"></p>
       <p><button class="btn primary" id="vBtn" disabled>Valider et calculer les scores</button></p></div>
+
+    <div class="panel"><h2>Prestige des courses</h2>
+      <p class="muted">Le coefficient multiplie tous les points d'une course : Tier 1 (Grands Tours et Monuments) ${fmtMult(2)}, Tier 2 (WorldTour) ${fmtMult(1.5)}, Tier 3 (ProSeries, Europe Tour) ${fmtMult(1)}. Règle-le avant la validation : il est figé ensuite.</p>
+      <div class="table-wrap"><table><thead><tr><th>Course</th><th>Date</th><th>Catégorie</th><th>Prestige</th></tr></thead><tbody>
+        ${races.length ? races.map(r => `<tr><td><b>${esc(r.name)}</b></td><td>${fmtDate(r.start_at)}</td><td>${esc(r.category || '–')}</td>
+          <td><select data-tier="${r.id}" aria-label="Prestige de ${esc(r.name)}">${[1, 2, 3].map(t => `<option value="${t}" ${tierOf(r) === t ? 'selected' : ''}>${TIERS[t].label} · ${esc(TIERS[t].long)} (${fmtMult(TIERS[t].mult)})</option>`).join('')}</select></td></tr>`).join('')
+          : '<tr><td colspan="4" class="muted">Aucune course à venir.</td></tr>'}
+      </tbody></table></div></div>
 
     <div class="panel"><h2>Offrir des boosters</h2>
       <p class="muted">Envoie des boosters à un joueur ou à toute la communauté. Le joueur reçoit un message dans sa messagerie avec un bouton « Réclamer mes boosters » (ou les boosters sont crédités tout de suite si tu coches la case correspondante). Les boosters offerts vont dans son stock et s'ouvrent gratuitement.</p>
@@ -2515,8 +2735,8 @@ async function pageAdmin(tab = 'general') {
       <p style="margin-top:.8rem"><button class="btn primary" id="gBtn">Envoyer le cadeau</button></p></div>
 
     <div class="panel"><h2>Ajouter des courses</h2>
-      <p class="muted">Une course par ligne, format : <code>Nom;Catégorie;AAAA-MM-JJ HH:MM</code> (heure de départ de ton fuseau). Copie les courses du calendrier L'Équipe puis mets-les à ce format.</p>
-      <textarea id="raceCsv" placeholder="Il Lombardia;WorldTour;2026-10-10 10:30"></textarea>
+      <p class="muted">Une course par ligne, format : <code>Nom;Catégorie;AAAA-MM-JJ HH:MM;Prestige</code> (heure de départ de ton fuseau). Le prestige est facultatif : 1 (Grands Tours et Monuments), 2 (WorldTour) ou 3 (ProSeries, par défaut). Copie les courses du calendrier L'Équipe puis mets-les à ce format.</p>
+      <textarea id="raceCsv" placeholder="Il Lombardia;WorldTour;2026-10-10 10:30;1"></textarea>
       <p><button class="btn" id="raceBtn">Importer les courses</button></p></div>
 
     <div class="panel"><h2>Importer des coureurs</h2>
@@ -2543,6 +2763,22 @@ async function pageAdmin(tab = 'general') {
     <div class="panel"><h2>Visuels des coureurs</h2>
       <p class="muted">Pour chaque coureur, envoie sur GitHub une photo dans le dossier <code>img/riders/</code> avec exactement le nom de fichier indiqué (.jpg, .png ou .webp). Le mot « manquant » disparaît quand la photo est trouvée.</p>
       <div class="table-wrap"><table><thead><tr><th>Coureur</th><th>Nom du fichier</th><th>Aperçu</th></tr></thead><tbody id="visBody"></tbody></table></div></div>`;
+
+  /* ----- Prestige des courses à venir ----- */
+  $$('[data-tier]').forEach(sel => {
+    sel.onchange = async () => {
+      const id = +sel.dataset.tier, tier = +sel.value;
+      const r = races.find(x => x.id === id);
+      if (!r) return;
+      const { error } = await sb.from('races').update({ tier_level: tier }).eq('id', id);
+      if (error) { sel.value = tierOf(r); return toast(error.message, 'error'); }
+      r.tier_level = tier;
+      const cur = $('#vr').value;
+      $('#vr').innerHTML = raceOptionsHTML();
+      $('#vr').value = cur;
+      toast(`${r.name} : ${TIERS[tier].label} (${fmtMult(TIERS[tier].mult)}).`, 'ok');
+    };
+  });
 
   /* ----- Statut de chaque ligne du classement par rapport au catalogue ----- */
   const statusInfo = () => {
@@ -2812,8 +3048,10 @@ async function pageAdmin(tab = 'general') {
     if (!raceId) return toast('Aucune course sélectionnée.', 'error');
     const n = statusInfo().filter(s => s.ok).length;
     if (!n) return toast('Aucun coureur du catalogue dans ce classement.', 'error');
-    const raceName = $('#vr').selectedOptions[0]?.textContent || 'cette course';
-    if (!await confirmBox(`Valider définitivement « ${raceName} » ? ${n} coureur${n > 1 ? 's' : ''} du catalogue sera${n > 1 ? 'ont' : ''} pris en compte, les points et pièces seront crédités aux joueurs.`, 'Valider')) return;
+    const race = races.find(r => r.id === raceId);
+    const raceName = race ? race.name : 'cette course';
+    const coef = race ? fmtMult(courseMult(race)) : fmtMult(1);
+    if (!await confirmBox(`Valider définitivement « ${raceName} » (coefficient de la course ${coef}) ? ${n} coureur${n > 1 ? 's' : ''} du catalogue sera${n > 1 ? 'ont' : ''} pris en compte, les points et pièces seront crédités aux joueurs.`, 'Valider')) return;
 
     const btn = $('#vBtn'); btn.disabled = true;
     const out = await callFn('process-race-scores', {
@@ -2822,14 +3060,18 @@ async function pageAdmin(tab = 'general') {
     });
     if (out.ok) {
       const d = out.data;
-      toast(`Course validée : ${d.players} équipe${d.players > 1 ? 's' : ''} créditée${d.players > 1 ? 's' : ''}, ${d.total_points} points distribués.`, 'ok');
+      toast(`Course validée (${fmtMult(d.multiplier ?? 1)}) : ${d.players} équipe${d.players > 1 ? 's' : ''} créditée${d.players > 1 ? 's' : ''}, ${d.total_points} points distribués.`, 'ok');
       pageAdmin();
       return;
     }
     if (out.unreachable) {
       /* Secours : la fonction serveur est injoignable, on applique le même calcul SQL directement */
       if (await confirmBox('La fonction serveur est injoignable. Valider directement avec le calcul intégré à la base (même barème, même résultat) ?', 'Valider directement')) {
-        const r = await rpc('validate_race', { p_race_id: raceId, p_results: matchedResults() });
+        const r = await rpc('validate_race', {
+          p_race_id: raceId,
+          p_results: matchedResults(),
+          p_names: top30.map(t => ({ pos: t.position, name: String(t.rider_name).trim() })),
+        });
         if (r.ok) { toast('Course validée, gains distribués.', 'ok'); pageAdmin(); return; }
       }
     } else {
@@ -2839,14 +3081,15 @@ async function pageAdmin(tab = 'general') {
     refreshStatus();
   };
 
-  /* ----- Import des courses ----- */
+  /* ----- Import des courses (prestige facultatif en 4e champ) ----- */
   $('#raceBtn').onclick = async () => {
     const rows = []; const bad = [];
     for (const line of $('#raceCsv').value.split('\n').map(l => l.trim()).filter(Boolean)) {
-      const [name, category = '', dt] = line.split(';').map(s => s.trim());
+      const [name, category = '', dt, tierRaw = ''] = line.split(';').map(s => s.trim());
       const d = dt ? new Date(dt.replace(' ', 'T')) : null;
-      if (!name || !d || isNaN(d)) { bad.push(line); continue; }
-      rows.push({ name, category, start_at: d.toISOString() });
+      const tier = tierRaw === '' ? 3 : parseInt(tierRaw, 10);
+      if (!name || !d || isNaN(d) || ![1, 2, 3].includes(tier)) { bad.push(line); continue; }
+      rows.push({ name, category, start_at: d.toISOString(), tier_level: tier });
     }
     if (bad.length) return toast('Ligne invalide : ' + bad[0], 'error');
     if (!rows.length) return toast('Rien à importer.', 'error');
