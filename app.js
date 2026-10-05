@@ -95,10 +95,19 @@ function computeTeamScore(riders, captainId, results, course = 1) {
 }
 
 const BOOSTERS = {
-  bronze: { name: 'Booster Bronze', price: 100, odds: 'Cartes communes, avec 8 % de chances d\'obtenir une rare par carte.' },
-  silver: { name: 'Booster Argent', price: 300, odds: 'Communes et rares, avec 6 % de chances d\'obtenir une ultra rare par carte.' },
-  gold:   { name: 'Booster Or',     price: 800, odds: 'Rare minimum, 22 % d\'ultra rares, et une fine chance de légendaire ou de mythique vintage.' },
+  bronze: { name: 'Booster Bronze', price: 100, odds: 'Surtout des communes (88 %), 11 % de rares et 1 % d\'ultra rares par carte.' },
+  silver: { name: 'Booster Argent', price: 300, odds: 'Communes, rares (33 %), 6,5 % d\'ultra rares et 0,5 % de légendaires par carte.' },
+  gold:   { name: 'Booster Or',     price: 800, odds: 'Rare minimum garanti, 20 % d\'ultra rares, 5 % de légendaires et 0,6 % de mythiques vintage par carte.' },
 };
+
+/* Taux de drop des boosters permanents, en % par carte (chaque ligne totalise 100).
+   À garder identique à _booster_weights() dans migration_rates.sql. */
+const BOOSTER_RATES = {
+  bronze: { common: 88, rare: 11,   ultra: 1,  legendary: 0,   mythic: 0 },
+  silver: { common: 60, rare: 33,   ultra: 6.5, legendary: 0.5, mythic: 0 },
+  gold:   { common: 0,  rare: 74.4, ultra: 20, legendary: 5,   mythic: 0.6 },
+};
+const BOOSTER_CARDS = 5;   // cartes par booster permanent
 const SPECIALTIES = ['sprinteur', 'grimpeur', 'rouleur', 'puncheur', 'classiques', 'complet', 'vintage'];
 
 /* Compétences des coureurs (jauges de type ProCyclingStats).
@@ -677,7 +686,7 @@ function bindStock(refresh) {
 /* =====================================================================
    PAGE : BOUTIQUE
    1. Boosters éphémères (offres limitées, créées par l'admin)
-   2. Boosters permanents (Bronze, Argent, Or)
+   2. Boosters permanents (Bronze, Argent, Or) avec leurs probabilités
    3. Offres spéciales (cartes vendues à l'unité)
    ===================================================================== */
 let shopTimer = null;
@@ -696,6 +705,37 @@ function guaranteeText(comp) {
   return `Garanti : au moins ${g.count} carte${g.count > 1 ? 's' : ''} ${RARITY[g.rarity].label.toLowerCase()} ou mieux.`;
 }
 const ephPoolSize = b => (Array.isArray(b.composition_json?.rider_ids) ? b.composition_json.rider_ids.length : 0);
+
+/* Les cinq raretés d'un booster permanent : [{ rarity, pct }] (0 % inclus, pour tout afficher) */
+function boosterOddsRows(type) {
+  const w = BOOSTER_RATES[type] || {};
+  return RARITY_ORDER.map(r => ({ rarity: r, pct: Math.max(0, Number(w[r]) || 0) }));
+}
+/* Chance d'obtenir au moins une carte d'une rareté dans un booster (cartes tirées indépendamment) */
+const atLeastOne = (pct, n = BOOSTER_CARDS) => (1 - Math.pow(1 - pct / 100, n)) * 100;
+/* Résumé court (info-bulle du bouton) */
+const ratesTitle = type => boosterOddsRows(type).filter(o => o.pct > 0).map(o => `${RARITY[o.rarity].label} ${fmtPct(o.pct)}`).join(' · ');
+
+/* Fenêtre « Probabilités » d'un booster permanent : pourcentage exact par rareté */
+function showBoosterRates(type) {
+  const b = BOOSTERS[type];
+  if (!b) return;
+  const rows = boosterOddsRows(type);
+  const total = rows.reduce((s, o) => s + o.pct, 0);
+  const m = openModal(`<h2>Probabilités : ${esc(b.name)}</h2>
+    <p class="muted">${BOOSTER_CARDS} cartes par booster · ${coin(b.price)}. Chaque carte est tirée au hasard et indépendamment des autres, selon les pourcentages ci-dessous. Le tirage est réalisé par le serveur.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Rareté</th><th class="num">Par carte</th><th>Proportion</th><th class="num">Au moins 1 par booster</th></tr></thead>
+      <tbody>${rows.map(o => `<tr style="${o.pct === 0 ? 'opacity:.55' : ''}">
+        <td><b style="color:${RARITY_COLOR[o.rarity]}">${esc(RARITY[o.rarity].label)}</b></td>
+        <td class="num"><b>${fmtPct(o.pct)}</b></td>
+        <td style="min-width:120px"><span style="display:block;height:10px;background:#E4E8EC;border-radius:5px;overflow:hidden"><span style="display:block;height:100%;width:${Math.min(100, o.pct).toFixed(2)}%;background:${RARITY_COLOR[o.rarity]}"></span></span></td>
+        <td class="num">${o.pct > 0 ? fmtPct(atLeastOne(o.pct)) : '–'}</td></tr>`).join('')}</tbody>
+    </table></div>
+    <p class="muted" style="margin:.8rem 0 0">Total : ${fmtPct(total)}.${BOOSTER_RATES[type].common === 0 ? ' Une carte rare ou mieux est garantie à chaque tirage (aucune commune dans ce booster).' : ''}${BOOSTER_RATES[type].mythic > 0 ? ` Les cartes mythiques vintage sont très rares : ${fmtPct(BOOSTER_RATES[type].mythic)} par carte.` : ''}</p>
+    <div class="row"><button class="btn primary" data-x>Fermer</button></div>`, { wide: true });
+  $('[data-x]', m.box).onclick = m.close;
+}
 
 /* Fenêtre « Voir le contenu » d'un booster éphémère : probabilités, garantie et pool de coureurs */
 async function showEphInfo(b) {
@@ -757,7 +797,7 @@ async function pageShop() {
       ${b.description ? `<p>${esc(b.description)}</p>` : ''}
       <p class="pool-note">${comp.cards || 5} cartes${pool ? ` · pool de ${pool} coureur${pool > 1 ? 's' : ''}` : ' · tout le catalogue'}</p>
       <div class="btn-row">
-        <button class="btn small" data-eph-info="${b.id}">Voir le contenu</button>
+        <button class="btn small" data-eph-info="${b.id}">ℹ️ Voir le contenu et les probabilités</button>
         <button class="btn primary" data-eph-buy="${b.id}" ${live ? '' : 'disabled'}>${live ? `Acheter pour ${coin(b.price)}` : 'Pas encore ouvert'}</button>
       </div>
     </article>`;
@@ -792,12 +832,15 @@ async function pageShop() {
 
     <section class="shop-sec">
       <h2>Boosters permanents</h2>
-      <p class="sub">Toujours disponibles. Chaque booster contient 5 cartes.</p>
+      <p class="sub">Toujours disponibles. Chaque booster contient ${BOOSTER_CARDS} cartes. Clique sur « ℹ️ Voir les probabilités » pour connaître le pourcentage exact de chaque rareté.</p>
       <div class="boosters">${Object.entries(BOOSTERS).map(([k, b]) => `
         <article class="pack pack-${k}">
           <div class="foil"><span>${b.name}</span><img src="img/boosters/${k}.png" alt="" onload="this.parentElement.classList.add('has-img')" onerror="this.remove()"></div>
           <p>${b.odds}</p>
-          <button class="btn primary" data-open="${k}">Ouvrir pour ${coin(b.price)}</button>
+          <div class="btn-row">
+            <button class="btn small" data-rates="${k}" title="${esc(ratesTitle(k))}">ℹ️ Voir les probabilités</button>
+            <button class="btn primary" data-open="${k}">Ouvrir pour ${coin(b.price)}</button>
+          </div>
         </article>`).join('')}</div></section>
 
     ${offers.length ? `<section class="shop-sec">
@@ -807,7 +850,8 @@ async function pageShop() {
 
   bindStock(() => pageShop());
 
-  /* ----- Boosters permanents ----- */
+  /* ----- Boosters permanents : probabilités et ouverture ----- */
+  $$('[data-rates]').forEach(btn => btn.onclick = () => showBoosterRates(btn.dataset.rates));
   $$('[data-open]').forEach(btn => btn.onclick = async () => {
     const type = btn.dataset.open;
     if (state.profile.coins < BOOSTERS[type].price) return toast('Pas assez de pièces pour ce booster.', 'error');
