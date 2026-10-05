@@ -97,15 +97,16 @@ function computeTeamScore(riders, captainId, results, course = 1) {
 const BOOSTERS = {
   bronze: { name: 'Booster Bronze', price: 100, odds: 'Surtout des communes (88 %), 11 % de rares et 1 % d\'ultra rares par carte.' },
   silver: { name: 'Booster Argent', price: 300, odds: 'Communes, rares (33 %), 6,5 % d\'ultra rares et 0,5 % de légendaires par carte.' },
-  gold:   { name: 'Booster Or',     price: 800, odds: 'Rare minimum garanti, 20 % d\'ultra rares, 5 % de légendaires et 0,6 % de mythiques vintage par carte.' },
+  gold:   { name: 'Booster Or',     price: 800, odds: 'Rare minimum garanti : environ 78 % de rares et 21 % d\'ultra rares par carte. 3 % de chances d\'obtenir une légendaire et 0,6 % une mythique vintage par booster.' },
 };
 
-/* Taux de drop des boosters permanents, en % par carte (chaque ligne totalise 100).
-   À garder identique à _booster_weights() dans migration_rates.sql. */
+/* Taux de drop des boosters permanents, en % PAR CARTE (chaque ligne totalise 100).
+   Un booster contient 5 cartes tirées indépendamment : chance par booster = 1 - (1 - p)^5.
+   À garder identique à _booster_weights() dans migration_rates_v2.sql. */
 const BOOSTER_RATES = {
-  bronze: { common: 88, rare: 11,   ultra: 1,  legendary: 0,   mythic: 0 },
-  silver: { common: 60, rare: 33,   ultra: 6.5, legendary: 0.5, mythic: 0 },
-  gold:   { common: 0,  rare: 74.4, ultra: 20, legendary: 5,   mythic: 0.6 },
+  bronze: { common: 88, rare: 11,    ultra: 1,   legendary: 0,    mythic: 0 },
+  silver: { common: 60, rare: 33,    ultra: 6.5, legendary: 0.5,  mythic: 0 },
+  gold:   { common: 0,  rare: 78.27, ultra: 21,  legendary: 0.61, mythic: 0.12 },
 };
 const BOOSTER_CARDS = 5;   // cartes par booster permanent
 const SPECIALTIES = ['sprinteur', 'grimpeur', 'rouleur', 'puncheur', 'classiques', 'complet', 'vintage'];
@@ -139,6 +140,13 @@ const BADGE_TYPES = {
   rarity:          'Coureurs d\'une même rareté',
   team_complete:   'Équipe complète',
 };
+
+/* Badges UCI (Leader du mois, Champion de l'année) : table uci_badges, migration_uci_badges.sql */
+const UCI_TYPES = {
+  monthly_uci_leader:  { label: 'Leader UCI du mois',        emoji: '👑', bg: 'linear-gradient(135deg,#FFD100,#FFF1A8)' },
+  annual_uci_champion: { label: 'Champion UCI de l\'année', emoji: '🏆', bg: 'linear-gradient(135deg,#ED1C24,#FFD100 28%,#1C8C52 52%,#49B2E8 76%,#92278F)' },
+};
+const MONTHS_FR = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
 
 /* ---------- Petits outils ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -188,6 +196,8 @@ const toLocalInput = iso => {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 };
 const fmtPct = n => `${(Math.round(n * 10) / 10).toLocaleString('fr-FR')} %`;
+/* Pourcentage avec jusqu'à 2 décimales (0,61 % et 0,12 % restent lisibles) */
+const fmtPct2 = n => `${(Math.round(n * 100) / 100).toLocaleString('fr-FR')} %`;
 /* Clé de comparaison de noms : sans accents, sans majuscules, espaces simplifiés */
 const nameKey = n => String(n ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
 /* Clé de rapprochement des noms de coureurs (résultats de course) : sans accents, sans ponctuation,
@@ -409,6 +419,60 @@ function badgesGalleryHTML(badges, unlocked, ctx) {
       <span class="bgoal">${esc(criteriaText(b))}</span>
       ${foot}</div>`;
   }).join('')}</div>`;
+}
+
+/* ---------- Badges UCI (Leader du mois, Champion de l'année) ---------- */
+/* Charge les badges UCI de tous les joueurs (ou d'un seul si userId est fourni).
+   Renvoie { missing, byUser: Map user_id -> [badges, du plus récent au plus ancien] }.
+   Silencieux si migration_uci_badges.sql n'est pas encore exécuté. */
+async function loadUciBadges(userId) {
+  try {
+    const rows = await fetchAll(() => {
+      let qy = sb.from('uci_badges').select('id,user_id,badge_type,title,period,icon_url,points,awarded_at');
+      if (userId) qy = qy.eq('user_id', userId);
+      return qy.order('awarded_at', { ascending: false }).order('id');
+    });
+    const byUser = new Map();
+    rows.forEach(r => {
+      if (!byUser.has(r.user_id)) byUser.set(r.user_id, []);
+      byUser.get(r.user_id).push(r);
+    });
+    return { missing: false, byUser };
+  } catch (e) {
+    return { missing: true, byUser: new Map() };
+  }
+}
+
+/* Icône d'un badge UCI : image si icon_url est renseignée, sinon emoji du type */
+function uciIcon(b) {
+  const t = UCI_TYPES[b.badge_type] || UCI_TYPES.monthly_uci_leader;
+  return b.icon_url
+    ? `<img src="${esc(b.icon_url)}" alt="" data-fb="${t.emoji}" onerror="this.replaceWith(document.createTextNode(this.dataset.fb))">`
+    : t.emoji;
+}
+
+/* Pastilles compactes à côté d'un pseudo : tous les titres de champion, et les 3 derniers titres de leader du mois */
+function uciInline(list) {
+  if (!list || !list.length) return '';
+  const annual = list.filter(b => b.badge_type === 'annual_uci_champion');
+  const monthly = list.filter(b => b.badge_type !== 'annual_uci_champion');
+  const shown = [...annual, ...monthly.slice(0, 3)];
+  const extra = monthly.length - 3;
+  return ` <span style="white-space:nowrap">${shown.map(b => {
+    const t = UCI_TYPES[b.badge_type] || UCI_TYPES.monthly_uci_leader;
+    return `<span title="${esc(b.title)}" style="cursor:help;margin-left:2px">${t.emoji}</span>`;
+  }).join('')}${extra > 0 ? `<span class="muted" title="${extra} autre${extra > 1 ? 's' : ''} titre${extra > 1 ? 's' : ''} de leader du mois" style="cursor:help;font-size:12px;margin-left:3px">+${extra}</span>` : ''}</span>`;
+}
+
+/* Tuile détaillée d'un badge UCI (profil) */
+function uciTileHTML(b) {
+  const t = UCI_TYPES[b.badge_type] || UCI_TYPES.monthly_uci_leader;
+  const annual = b.badge_type === 'annual_uci_champion';
+  return `<div class="badge-tile" style="${annual ? 'border-color:#B86A00;background:#FFF9D6' : ''}">
+    <div class="bicon" style="background:${t.bg}">${uciIcon(b)}</div>
+    <b>${esc(b.title)}</b>
+    <span class="bgoal">${esc(t.label)} · ${b.points} pts</span>
+    <span class="bdate">Décerné le ${esc(new Date(b.awarded_at).toLocaleDateString('fr-FR'))}</span></div>`;
 }
 
 /* Vitrine (3 cartes favorites) et badges d'un joueur. Silencieux si le SQL n'est pas encore installé. */
@@ -711,28 +775,31 @@ function boosterOddsRows(type) {
   const w = BOOSTER_RATES[type] || {};
   return RARITY_ORDER.map(r => ({ rarity: r, pct: Math.max(0, Number(w[r]) || 0) }));
 }
-/* Chance d'obtenir au moins une carte d'une rareté dans un booster (cartes tirées indépendamment) */
+/* Chance d'obtenir au moins une carte d'une rareté dans un booster (cartes tirées indépendamment) : 1 - (1 - p)^n */
 const atLeastOne = (pct, n = BOOSTER_CARDS) => (1 - Math.pow(1 - pct / 100, n)) * 100;
-/* Résumé court (info-bulle du bouton) */
-const ratesTitle = type => boosterOddsRows(type).filter(o => o.pct > 0).map(o => `${RARITY[o.rarity].label} ${fmtPct(o.pct)}`).join(' · ');
+/* Résumé court (info-bulle du bouton) : chance par booster */
+const ratesTitle = type => boosterOddsRows(type).filter(o => o.pct > 0)
+  .map(o => `${RARITY[o.rarity].label} ${fmtPct(atLeastOne(o.pct))} par booster`).join(' · ');
 
-/* Fenêtre « Probabilités » d'un booster permanent : pourcentage exact par rareté */
+/* Fenêtre « Probabilités » d'un booster permanent (BoosterProbabilitiesModal) :
+   chance PAR BOOSTER en premier, puis pourcentage par carte */
 function showBoosterRates(type) {
   const b = BOOSTERS[type];
   if (!b) return;
   const rows = boosterOddsRows(type);
   const total = rows.reduce((s, o) => s + o.pct, 0);
+  const rates = BOOSTER_RATES[type];
   const m = openModal(`<h2>Probabilités : ${esc(b.name)}</h2>
-    <p class="muted">${BOOSTER_CARDS} cartes par booster · ${coin(b.price)}. Chaque carte est tirée au hasard et indépendamment des autres, selon les pourcentages ci-dessous. Le tirage est réalisé par le serveur.</p>
+    <p class="muted">${BOOSTER_CARDS} cartes par booster · ${coin(b.price)}. Chaque carte est tirée au hasard et indépendamment des autres, selon le pourcentage « par carte ». La colonne « Par booster » indique ta chance de trouver <b>au moins une</b> carte de cette rareté en ouvrant un booster : 1 − (1 − p)<sup>${BOOSTER_CARDS}</sup>. Le tirage est réalisé par le serveur.</p>
     <div class="table-wrap"><table>
-      <thead><tr><th>Rareté</th><th class="num">Par carte</th><th>Proportion</th><th class="num">Au moins 1 par booster</th></tr></thead>
+      <thead><tr><th>Rareté</th><th class="num">Par booster (au moins 1)</th><th class="num">Par carte</th><th>Proportion par carte</th></tr></thead>
       <tbody>${rows.map(o => `<tr style="${o.pct === 0 ? 'opacity:.55' : ''}">
         <td><b style="color:${RARITY_COLOR[o.rarity]}">${esc(RARITY[o.rarity].label)}</b></td>
-        <td class="num"><b>${fmtPct(o.pct)}</b></td>
-        <td style="min-width:120px"><span style="display:block;height:10px;background:#E4E8EC;border-radius:5px;overflow:hidden"><span style="display:block;height:100%;width:${Math.min(100, o.pct).toFixed(2)}%;background:${RARITY_COLOR[o.rarity]}"></span></span></td>
-        <td class="num">${o.pct > 0 ? fmtPct(atLeastOne(o.pct)) : '–'}</td></tr>`).join('')}</tbody>
+        <td class="num" style="${o.pct > 0 ? 'background:#FFF9D6' : ''}"><b>${o.pct > 0 ? fmtPct(atLeastOne(o.pct)) : '0 %'}</b></td>
+        <td class="num">${fmtPct2(o.pct)}</td>
+        <td style="min-width:120px"><span style="display:block;height:10px;background:#E4E8EC;border-radius:5px;overflow:hidden"><span style="display:block;height:100%;width:${Math.min(100, o.pct).toFixed(2)}%;background:${RARITY_COLOR[o.rarity]}"></span></span></td></tr>`).join('')}</tbody>
     </table></div>
-    <p class="muted" style="margin:.8rem 0 0">Total : ${fmtPct(total)}.${BOOSTER_RATES[type].common === 0 ? ' Une carte rare ou mieux est garantie à chaque tirage (aucune commune dans ce booster).' : ''}${BOOSTER_RATES[type].mythic > 0 ? ` Les cartes mythiques vintage sont très rares : ${fmtPct(BOOSTER_RATES[type].mythic)} par carte.` : ''}</p>
+    <p class="muted" style="margin:.8rem 0 0">Total par carte : ${fmtPct(total)}.${rates.common === 0 ? ' Une carte rare ou mieux est garantie à chaque tirage (aucune commune dans ce booster).' : ''}${rates.mythic > 0 ? ` Les cartes mythiques vintage sont très rares : environ ${fmtPct(atLeastOne(rates.mythic))} de chances d'en trouver une dans un booster.` : ''}</p>
     <div class="row"><button class="btn primary" data-x>Fermer</button></div>`, { wide: true });
   $('[data-x]', m.box).onclick = m.close;
 }
@@ -751,7 +818,7 @@ async function showEphInfo(b) {
     ${b.description ? `<p class="muted">${esc(b.description)}</p>` : ''}
     <p><b>${comp.cards || 5} cartes</b> par booster · <b>${coin(b.price)}</b></p>
     <h3>Probabilités par carte</h3>
-    <div class="odds">${odds.map(o => `<div class="odds-row"><span>${RARITY[o.rarity].label}</span><b>${fmtPct(o.pct)}</b></div>`).join('')}</div>
+    <div class="odds">${odds.map(o => `<div class="odds-row"><span>${RARITY[o.rarity].label}</span><b>${fmtPct2(o.pct)}</b></div>`).join('')}</div>
     ${guaranteeText(comp) ? `<p><b>${esc(guaranteeText(comp))}</b></p>` : ''}
     <h3>${ids.length ? `Pool de coureurs (${ids.length})` : 'Pool de coureurs'}</h3>
     ${ids.length
@@ -832,7 +899,7 @@ async function pageShop() {
 
     <section class="shop-sec">
       <h2>Boosters permanents</h2>
-      <p class="sub">Toujours disponibles. Chaque booster contient ${BOOSTER_CARDS} cartes. Clique sur « ℹ️ Voir les probabilités » pour connaître le pourcentage exact de chaque rareté.</p>
+      <p class="sub">Toujours disponibles. Chaque booster contient ${BOOSTER_CARDS} cartes. Clique sur « ℹ️ Voir les probabilités » pour connaître ta chance exacte, par booster et par carte, pour chaque rareté.</p>
       <div class="boosters">${Object.entries(BOOSTERS).map(([k, b]) => `
         <article class="pack pack-${k}">
           <div class="foil"><span>${b.name}</span><img src="img/boosters/${k}.png" alt="" onload="this.parentElement.classList.add('has-img')" onerror="this.remove()"></div>
@@ -1960,27 +2027,34 @@ async function pageWallet() {
 }
 
 /* =====================================================================
-   PAGE : CLASSEMENT UCI
+   PAGE : CLASSEMENT UCI (avec les badges UCI à côté des pseudos)
    ===================================================================== */
 async function pageRanking() {
-  const [rows, races] = await Promise.all([
+  const [rows, races, uci] = await Promise.all([
     q(sb.from('public_profiles').select('id,username,points_total,card_count').order('points_total', { ascending: false }).order('username').limit(100)),
     q(sb.from('races').select('id,name,start_at').eq('status', 'finished').order('start_at', { ascending: false })),
+    loadUciBadges(),
   ]);
+  /* Badges par pseudo (le classement d'une course ne fournit que le pseudo) */
+  const holderNames = uci.byUser.size ? await usernames([...uci.byUser.keys()]) : {};
+  const byName = new Map();
+  uci.byUser.forEach((list, id) => { if (holderNames[id]) byName.set(holderNames[id], list); });
+
   app.innerHTML = `<h1>Classement UCI</h1>
+    ${uci.missing ? '' : '<p class="muted">👑 Leader UCI du mois · 🏆 Champion UCI de l\'année : survole un badge pour voir sa période.</p>'}
     <div class="filters"><label>Classement<select id="rk"><option value="">Général</option>${races.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}</select></label></div>
     <div class="table-wrap" id="tbl"></div>`;
   const drawGeneral = () => {
     $('#tbl').innerHTML = `<table><thead><tr><th>#</th><th>Joueur</th><th class="num">Points</th><th class="num">Cartes</th></tr></thead><tbody>
       ${rows.map((r, i) => `<tr class="${r.id === state.uid ? 'me' : ''}"><td>${i + 1}</td>
-        <td><a href="#/profil/${encodeURIComponent(r.username)}">${esc(r.username)}</a></td><td class="num">${r.points_total}</td><td class="num">${r.card_count}</td></tr>`).join('')}
+        <td><a href="#/profil/${encodeURIComponent(r.username)}">${esc(r.username)}</a>${uciInline(uci.byUser.get(r.id))}</td><td class="num">${r.points_total}</td><td class="num">${r.card_count}</td></tr>`).join('')}
     </tbody></table>`;
   };
   const drawRace = async id => {
     const data = await q(sb.rpc('race_ranking', { p_race_id: +id }));
     $('#tbl').innerHTML = `<table><thead><tr><th>#</th><th>Joueur</th><th class="num">Points</th><th class="num">Pièces</th></tr></thead><tbody>
       ${data.length ? data.map((r, i) => `<tr class="${r.username === state.profile.username ? 'me' : ''}"><td>${i + 1}</td>
-        <td><a href="#/profil/${encodeURIComponent(r.username)}">${esc(r.username)}</a></td><td class="num">${r.points}</td><td class="num">${r.coins_earned}</td></tr>`).join('')
+        <td><a href="#/profil/${encodeURIComponent(r.username)}">${esc(r.username)}</a>${uciInline(byName.get(r.username))}</td><td class="num">${r.points}</td><td class="num">${r.coins_earned}</td></tr>`).join('')
         : '<tr><td colspan="4" class="muted">Personne n\'a aligné d\'équipe sur cette course.</td></tr>'}
     </tbody></table>`;
   };
@@ -1989,21 +2063,23 @@ async function pageRanking() {
 }
 
 /* =====================================================================
-   PAGE : PROFIL PUBLIC (vitrine, badges, collection)
+   PAGE : PROFIL PUBLIC (badges UCI, vitrine, badges, collection)
    ===================================================================== */
 async function pageProfile(username) {
   if (!username) username = state.profile.username;
   const p = await q(sb.from('public_profiles').select('*').eq('username', username.toLowerCase()).maybeSingle());
   if (!p) { app.innerHTML = '<p class="error">Joueur introuvable.</p>'; return; }
-  const [cards, ahead, show] = await Promise.all([
+  const [cards, ahead, show, uci] = await Promise.all([
     q(sb.from('user_cards').select('id,rider_id,acquired_at,riders(*)').eq('owner_id', p.id)),
     sb.from('public_profiles').select('id', { count: 'exact', head: true }).gt('points_total', p.points_total),
     loadShowcase(p.id),
+    loadUciBadges(p.id),
   ]);
+  const uciList = uci.byUser.get(p.id) || [];
   const counts = Object.fromEntries(RARITY_ORDER.map(r => [r, cards.filter(c => c.riders.rarity === r).length]));
   const mine = p.id === state.uid;
   const got = show.badges.filter(b => show.unlocked.has(b.id)).length;
-  app.innerHTML = `<h1>${esc(p.username)}</h1>
+  app.innerHTML = `<h1>${esc(p.username)}${uciInline(uciList)}</h1>
     <div class="stat-row">
       <div class="stat"><b>${(ahead.count ?? 0) + 1}<sup style="font-size:.5em">e</sup></b><span>au classement</span></div>
       <div class="stat"><b>${p.points_total}</b><span>points</span></div>
@@ -2011,6 +2087,10 @@ async function pageProfile(username) {
       ${show.missing ? '' : `<div class="stat"><b>${got}/${show.badges.length}</b><span>badges</span></div>`}
     </div>
     <p class="muted">${RARITY_ORDER.slice().reverse().filter(r => counts[r]).map(r => `${counts[r]} ${RARITY[r].label.toLowerCase()}${counts[r] > 1 ? 's' : ''}`).join(', ') || 'Vitrine vide.'}</p>
+    ${uci.missing ? '' : `<h2 style="margin-top:1.5rem">Badges UCI</h2>
+      ${uciList.length
+        ? `<div class="badges-grid">${uciList.map(uciTileHTML).join('')}</div>`
+        : '<p class="muted">Aucun badge UCI pour le moment. Les badges de Leader du mois et de Champion de l\'année sont décernés automatiquement aux meilleurs joueurs du classement.</p>'}`}
     ${show.missing ? '' : `<h2 style="margin-top:1.5rem">Cartes favorites</h2>
       ${mine ? '<p><a href="#/portefeuille"><b>Modifier ma vitrine</b></a></p>' : ''}
       <div id="favs">${favsReadonlyHTML(show.favs)}</div>
@@ -2181,7 +2261,8 @@ const adminTabs = tab => `<div class="tabs">
   <a href="#/admin/badges" class="${tab === 'badges' ? 'on' : ''}">Badges</a></div>`;
 
 /* =====================================================================
-   ADMIN > BADGES : création, édition, activation, suppression des badges
+   ADMIN > BADGES : succès (création, édition, activation, suppression)
+   et badges UCI (attribution manuelle d'une période terminée, liste)
    ===================================================================== */
 async function adminBadges() {
   let badges, ubRows, ridersAll;
@@ -2208,7 +2289,52 @@ async function adminBadges() {
       <p class="btnrow"><button class="btn primary" id="bNew">Créer un badge</button>
         <button class="btn" id="bRecheck">Recalculer pour tous les joueurs</button></p>
       <div class="table-wrap"><table><thead><tr><th>Badge</th><th>Condition</th><th class="num">Débloqué par</th><th>Statut</th><th></th></tr></thead>
-        <tbody id="bbody"></tbody></table></div></div>`;
+        <tbody id="bbody"></tbody></table></div></div>
+    <div class="panel" id="uciPanel"><p class="muted">Chargement des badges UCI…</p></div>`;
+
+  /* ----- Badges UCI : attribution manuelle et liste ----- */
+  const drawUci = async () => {
+    const box = $('#uciPanel');
+    const uci = await loadUciBadges();
+    if (uci.missing) {
+      box.innerHTML = `<h2>Badges UCI</h2><p><b class="error">Table uci_badges introuvable.</b>
+        <span class="muted"> Exécute migration_uci_badges.sql dans Supabase (SQL Editor), puis recharge cette page.</span></p>`;
+      return;
+    }
+    const all = [...uci.byUser.values()].flat().sort((a, b) => +new Date(b.awarded_at) - +new Date(a.awarded_at));
+    const names = uci.byUser.size ? await usernames([...uci.byUser.keys()]) : {};
+    const prev = new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1);
+    box.innerHTML = `<h2>Badges UCI (Leader du mois, Champion de l'année)</h2>
+      <p class="muted">Attribués automatiquement par une tâche programmée : le dernier jour de chaque mois à 23h59 (heure de Paris) pour le Leader du mois, et le 31 décembre à 23h59 pour le Champion de l'année. Le classement d'une période = somme des points des équipes sur les courses terminées dont le départ tombe dans la période. Si tu valides une course après ce passage, utilise le bouton ci-dessous pour rattraper la période : les badges déjà décernés ne sont jamais dupliqués.</p>
+      <div class="filters">
+        <label>Badge<select id="uk"><option value="month">Leader UCI du mois</option><option value="year">Champion UCI de l'année</option></select></label>
+        <label>Année<input id="uy" type="number" min="2020" max="2100" step="1" value="${prev.getFullYear()}" style="width:110px"></label>
+        <label id="umw">Mois<select id="um">${MONTHS_FR.map((n, i) => `<option value="${i + 1}" ${i === prev.getMonth() ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+        <button class="btn primary" id="uGo">Attribuer maintenant</button>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>Badge</th><th>Joueur</th><th class="num">Points</th><th>Décerné le</th></tr></thead><tbody>
+        ${all.length ? all.map(b => `<tr><td>${(UCI_TYPES[b.badge_type] || UCI_TYPES.monthly_uci_leader).emoji} <b>${esc(b.title)}</b></td>
+          <td>${esc(names[b.user_id] || '?')}</td><td class="num">${b.points}</td><td>${fmtDate(b.awarded_at)}</td></tr>`).join('')
+          : '<tr><td colspan="4" class="muted">Aucun badge UCI décerné pour le moment.</td></tr>'}
+      </tbody></table></div>`;
+    const syncKind = () => { $('#umw').style.display = $('#uk').value === 'month' ? '' : 'none'; };
+    $('#uk').onchange = syncKind;
+    syncKind();
+    $('#uGo').onclick = async () => {
+      const kind = $('#uk').value;
+      const year = parseInt($('#uy').value, 10);
+      const month = kind === 'month' ? parseInt($('#um').value, 10) : null;
+      if (!Number.isInteger(year) || year < 2020 || year > 2100) return toast('Année invalide.', 'error');
+      const label = kind === 'month' ? `${MONTHS_FR[month - 1]} ${year}` : `la saison ${year}`;
+      if (!await confirmBox(`Attribuer le badge UCI de ${label} au(x) premier(s) du classement de cette période ?`, 'Attribuer')) return;
+      const btn = $('#uGo'); btn.disabled = true;
+      const r = await rpc('admin_award_uci_badges', { p_kind: kind, p_year: year, p_month: month });
+      btn.disabled = false;
+      if (!r.ok) return;
+      toast(r.data > 0 ? `${r.data} badge${r.data > 1 ? 's' : ''} attribué${r.data > 1 ? 's' : ''}.` : 'Aucun nouveau badge : déjà attribué, ou personne n\'a de points sur cette période.', r.data > 0 ? 'ok' : '');
+      drawUci();
+    };
+  };
 
   const drawList = () => {
     $('#bbody').innerHTML = badges.length ? badges.map(b => `<tr>
@@ -2365,6 +2491,7 @@ async function adminBadges() {
   };
 
   drawList();
+  drawUci();
 }
 
 /* =====================================================================
@@ -2563,7 +2690,7 @@ async function adminShop() {
         </div>
         <label>Description (500 caractères maximum)<textarea name="desc" maxlength="500" style="min-height:70px">${esc(b?.description || '')}</textarea></label>
 
-        <fieldset class="stats-edit weights"><legend>Probabilités par rareté (poids relatifs)</legend>
+        <fieldset class="stats-edit weights"><legend>Probabilités par rareté (poids relatifs, par carte)</legend>
           ${RARITY_ORDER.map(r => `<label>${RARITY[r].label}<input type="number" min="0" step="any" name="w_${r}" value="${Number(w0[r]) || 0}"></label>`).join('')}
         </fieldset>
         <p class="muted" id="eodds" style="margin:0"></p>
@@ -2619,7 +2746,7 @@ async function adminShop() {
     const drawOdds = () => {
       const odds = compOdds(readComp());
       $('#eodds', m.box).textContent = odds.length
-        ? 'Probabilités par carte : ' + odds.map(o => `${RARITY[o.rarity].label} ${fmtPct(o.pct)}`).join(' · ')
+        ? 'Probabilités par carte : ' + odds.map(o => `${RARITY[o.rarity].label} ${fmtPct2(o.pct)}`).join(' · ')
         : 'Renseigne au moins un poids supérieur à 0.';
     };
     RARITY_ORDER.forEach(r => { f.elements['w_' + r].oninput = drawOdds; });
