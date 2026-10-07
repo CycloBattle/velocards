@@ -10,12 +10,13 @@
 const sb = window.supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
 
 /* ---------- Constantes d'affichage (à garder alignées avec le SQL) ---------- */
+/* La rarete ne change plus les points d'une course : « value » sert au marche et au recyclage */
 const RARITY = {
-  common:    { label: 'Commune',           value: 20,   mult: 1 },
-  rare:      { label: 'Rare',              value: 60,   mult: 1.1 },
-  ultra:     { label: 'Ultra rare',        value: 200,  mult: 1.25 },
-  legendary: { label: 'Légendaire',        value: 600,  mult: 1.5 },
-  mythic:    { label: 'Mythique vintage',  value: 1500, mult: 1.75 },
+  common:    { label: 'Commune',           value: 20 },
+  rare:      { label: 'Rare',              value: 60 },
+  ultra:     { label: 'Ultra rare',        value: 200 },
+  legendary: { label: 'Légendaire',        value: 600 },
+  mythic:    { label: 'Mythique vintage',  value: 1500 },
 };
 const RARITY_ORDER = ['common', 'rare', 'ultra', 'legendary', 'mythic'];
 const RARITY_COLOR = { common: '#6B7785', rare: '#2C6BD8', ultra: '#7B3FD4', legendary: '#B86A00', mythic: '#6E4A2A' };
@@ -33,19 +34,35 @@ const CAPTAIN_TOP = 10;   // ...uniquement s'il termine dans le Top 10 réel
 const MYTHIC_BONUS = 40;  // bonus fixe des cartes mythiques (coureurs retraités)
 const TEAM_SIZE = 8;
 
-/* Prestige des courses : coefficient appliqué à tous les points.
-   À garder aligné avec race_multiplier() dans migration_prestige.sql. */
+/* Prestige des courses : coefficient applique a tous les points.
+   A garder aligne avec race_multiplier() dans migration_coefficients.sql. */
 const TIERS = {
-  1: { label: 'Tier 1', long: 'Grands Tours & Monuments', mult: 2 },
-  2: { label: 'Tier 2', long: 'WorldTour', mult: 1.5 },
-  3: { label: 'Tier 3', long: 'ProSeries / Europe Tour', mult: 1 },
+  1: { label: 'Tier 1', long: 'Grands Tours, Mondiaux & Monuments', mult: 2 },
+  2: { label: 'Tier 2', long: 'WorldTour, Europe & Nationaux', mult: 1.8 },
+  3: { label: 'Tier 3', long: 'UCI ProSeries (.Pro)', mult: 1.4 },
+  4: { label: 'Tier 4', long: 'Courses continentales (.1 / .2)', mult: 1 },
 };
-const tierOf = r => (TIERS[r?.tier_level] ? r.tier_level : 3);
-const courseMult = r => TIERS[tierOf(r)].mult;
+const tierOf = r => (TIERS[r?.tier_level] ? r.tier_level : 4);
+/* Coefficient d'une course : fige a la validation (course_mult) pour les courses terminees, sinon celui du niveau */
+const courseMult = r => {
+  const f = Number(r?.course_mult);
+  return Number.isFinite(f) && f > 0 ? f : TIERS[tierOf(r)].mult;
+};
 const fmtMult = m => `×${String(m).replace('.', ',')}`;
 function tierBadge(r, { long = false } = {}) {
-  const t = tierOf(r);
-  return `<span class="tier t${t}" title="${esc(TIERS[t].long)} : points ${fmtMult(TIERS[t].mult)}">${t === 1 ? '★ ' : ''}${TIERS[t].label}${long ? ' · ' + esc(TIERS[t].long) : ''} · ${fmtMult(TIERS[t].mult)}</span>`;
+  const t = tierOf(r), m = courseMult(r);
+  return `<span class="tier t${t}" title="${esc(TIERS[t].long)} : points ${fmtMult(m)}">${t === 1 ? '★ ' : ''}${TIERS[t].label}${long ? ' · ' + esc(TIERS[t].long) : ''} · ${fmtMult(m)}</span>`;
+}
+ 
+/* Niveau de prestige deduit du nom et de la categorie (import des courses).
+   Meme logique que le reclassement de migration_coefficients.sql. */
+function guessTier(name, category) {
+  const n = String(name ?? ''), c = String(category ?? ''), both = n + ' ' + c;
+  if (/(tour de france|giro d.italia|vuelta a espa|vuelta ciclista a espa|^la vuelta|paris-roubaix|tour des flandres|ronde van vlaanderen|milano-sanremo|milan-san remo|li[eè]ge-bastogne|il lombardia|giro di lombardia|tour de lombardie|championnats? du monde|world championships?)/i.test(n)) return 1;
+  if (/(world ?tour|uwt)/i.test(c) || /(^|[^a-z])(wt|cn)([^a-z]|$)/i.test(c)
+    || /(championnats? d.europe|european championships?|championnats? nationaux|championnat national|national championships?)/i.test(both)) return 2;
+  if (/(\.pro|pro ?series)/i.test(c)) return 3;
+  return 4;
 }
 
 /* Arrondi à l'entier inférieur, insensible aux petites erreurs de virgule flottante */
@@ -56,22 +73,22 @@ function basePoints(pos) {
   return Number.isInteger(pos) && pos >= 1 && pos <= MAX_POSITION ? POSITION_POINTS[pos - 1] : 0;
 }
 
-/* Points d'une carte : base x rareté x capitaine (x2 si Top 10) x coefficient de la course.
-   Carte mythique : bonus fixe x coefficient de la course.
-   Doit rester identique à la fonction SQL validate_race. */
+/* Points d'une carte : base x capitaine (x2 si Top 10) x coefficient de la course.
+   La rarete n'intervient pas. Carte mythique : bonus fixe x coefficient de la course.
+   Doit rester identique a la fonction SQL validate_race. */
 function cardPoints(rarity, pos, isCaptain = false, course = 1) {
   if (rarity === 'mythic') return flo(MYTHIC_BONUS * course);
   const base = basePoints(pos);
   const cap = isCaptain && Number.isInteger(pos) && pos >= 1 && pos <= CAPTAIN_TOP ? CAPTAIN_MULT : 1;
-  return flo(base * (RARITY[rarity]?.mult ?? 1) * cap * course);
+  return flo(base * cap * course);
 }
-
-/* Calculateur du score d'une équipe à partir des résultats réels.
-   - riders    : tableau de { id, rarity } (les coureurs alignés)
+ 
+/* Calculateur du score d'une equipe a partir des resultats reels.
+   - riders    : tableau de { id, rarity } (les coureurs alignes)
    - captainId : id du coureur capitaine (ou null)
-   - results   : tableau de { pos, rider_id } (classement réel enregistré en base)
-   - course    : coefficient de la course (1, 1.5 ou 2)
-   Renvoie { cards: [{ rider_id, pos, base, mult, isCaptain, captainApplied, course, points }], total } */
+   - results   : tableau de { pos, rider_id } (classement reel enregistre en base)
+   - course    : coefficient de la course
+   Renvoie { cards: [{ rider_id, pos, base, isCaptain, captainApplied, course, points }], total } */
 function computeTeamScore(riders, captainId, results, course = 1) {
   const posByRider = new Map(results.map(r => [r.rider_id, r.pos]));
   const cards = riders.map(r => {
@@ -84,7 +101,6 @@ function computeTeamScore(riders, captainId, results, course = 1) {
       pos,
       mythic,
       base: mythic ? MYTHIC_BONUS : basePoints(pos),
-      mult: RARITY[r.rarity]?.mult ?? 1,
       isCaptain,
       captainApplied,
       course,
@@ -110,6 +126,11 @@ const BOOSTER_RATES = {
 };
 const BOOSTER_CARDS = 5;   // cartes par booster permanent
 const SPECIALTIES = ['sprinteur', 'grimpeur', 'rouleur', 'puncheur', 'classiques', 'complet', 'vintage'];
+/* Libelles des profils de coureurs (filtre de la composition d'equipe) */
+const SPECIALTY_LABEL = {
+  sprinteur: 'Sprinteur', grimpeur: 'Grimpeur', rouleur: 'Rouleur', puncheur: 'Puncheur',
+  classiques: 'Classiques', complet: 'Polyvalent / Véloce', vintage: 'Vintage',
+};
 
 /* Compétences des coureurs (jauges de type ProCyclingStats).
    STAT_MAX = note qui remplit entièrement la barre (au-delà, la barre reste pleine). */
@@ -1399,22 +1420,20 @@ function raceReportHTML(race, report) {
       ${best ? `<div class="mvp-box"><b>🏆 MVP de l'équipe</b><br>${esc(bestName)} : ${best.points} points</div>` : ''}
     </div>
     <div class="table-wrap"><table class="rtable">
-      <thead><tr><th>Coureur</th><th class="num">Place réelle</th><th class="num">Points de base</th><th>× Rareté</th><th>× Capitaine</th><th>× Course</th><th class="num">= Total</th></tr></thead>
+      <thead><tr><th>Coureur</th><th class="num">Place réelle</th><th class="num">Points de base</th><th>× Capitaine</th><th>× Course</th><th class="num">= Total</th></tr></thead>
       <tbody>${sorted.map(c => {
         const r = c.rider || { name: '?', rarity: 'common' };
         const isMvp = best && c.rider_id === best.rider_id;
         return `<tr class="${isMvp ? 'mvp' : ''}">
-          <td>${esc(r.name)}${c.isCaptain ? ' <span class="captain-mark">★ Capitaine</span>' : ''}${isMvp ? '<span class="mvp-tag">🏆 MVP</span>' : ''}
-            <span class="rar-note">${RARITY[r.rarity]?.label || ''}</span></td>
+          <td>${esc(r.name)}${c.isCaptain ? ' <span class="captain-mark">★ Capitaine</span>' : ''}${isMvp ? '<span class="mvp-tag">🏆 MVP</span>' : ''}</td>
           <td class="num">${c.mythic ? '–' : c.pos === null ? 'hors Top ' + MAX_POSITION : ordinal(c.pos)}</td>
           <td class="num">${c.mythic ? MYTHIC_BONUS + ' (bonus)' : c.base}</td>
-          <td class="mul">${c.mythic ? '–' : fmtMult(c.mult)}</td>
           <td class="mul">${c.isCaptain ? (c.captainApplied ? fmtMult(CAPTAIN_MULT) : '×1 (hors Top ' + CAPTAIN_TOP + ')') : '–'}</td>
           <td class="mul">${fmtMult(c.course)}</td>
           <td class="tot">= ${c.points}</td></tr>`;
       }).join('')}</tbody>
     </table></div>
-    ${report.sum !== report.total ? `<p class="muted" style="margin:.8rem 0 0">Le total officiel (${report.total}) fait foi : il a été calculé au moment de la validation de la course.</p>` : ''}`;
+    ${report.sum !== report.total ? `<p class="muted" style="margin:.8rem 0 0">Le total officiel (${report.total}) fait foi : il a été calculé au moment de la validation de la course. Pour les courses anciennes, le détail peut différer légèrement car la rareté comptait à l'époque.</p>` : ''}`;
 }
 
 /* Fenêtre « rapport de fin de course » (RaceSummaryModal) */
@@ -1466,16 +1485,55 @@ async function showCompetitorLineup(race, entry, username, results) {
   m.box.onkeydown = e => { if (e.key === 'Enter') open(e.target); };
 }
 
-async function pageTeam(raceId) {
-  if (raceId) return composer(+raceId);
+/* Boutons d'acces rapide en haut de la page Equipe */
+const teamTabs = active => `<div class="row" style="margin:1rem 0">
+  <a class="btn ${active === 'avenir' ? 'primary' : ''}" href="#/equipe" style="text-decoration:none">📅 Courses à venir</a>
+  <a class="btn ${active === 'terminees' ? 'primary' : ''}" href="#/equipe/terminees" style="text-decoration:none">🏁 Voir les courses terminées</a></div>`;
+ 
+/* Historique : toutes les courses terminees, avec recherche par nom */
+async function pageFinishedRaces() {
+  const [done, mine] = await Promise.all([
+    q(sb.from('races').select('*').eq('status', 'finished').order('start_at', { ascending: false }).limit(300)),
+    q(sb.from('lineups').select('race_id,points,coins_earned').eq('user_id', state.uid)),
+  ]);
+  const mineMap = new Map(mine.map(m => [m.race_id, m]));
+  const played = done.filter(r => mineMap.has(r.id)).length;
+  app.innerHTML = `<h1>Équipe</h1>
+    ${teamTabs('terminees')}
+    <h2>Courses terminées</h2>
+    <p class="lead">${done.length} course${done.length > 1 ? 's' : ''} terminée${done.length > 1 ? 's' : ''}, dont ${played} où tu avais une équipe. Clique sur une course pour voir ton rapport, le classement officiel et les équipes des autres joueurs.</p>
+    <div class="filters"><label>Rechercher une course<input id="rq" placeholder="Nom de la course" autocomplete="off"></label>
+      <label>Afficher<select id="rf"><option value="">Toutes</option><option value="mine">Où j'avais une équipe</option></select></label></div>
+    <div class="race-list" id="rlist"></div>`;
+  const draw = () => {
+    const fq = nameKey($('#rq').value), fm = $('#rf').value;
+    const list = done.filter(r => (!fq || nameKey(r.name).includes(fq)) && (fm !== 'mine' || mineMap.has(r.id)));
+    $('#rlist').innerHTML = list.length ? list.map(r => {
+      const d = mineMap.get(r.id);
+      return `<a class="panel race-item t${tierOf(r)}" href="#/equipe/${r.id}" style="text-decoration:none">
+        <div class="grow"><h3>${esc(r.name)}</h3><span class="muted">${fmtDate(r.start_at)} ${r.category ? '(' + esc(r.category) + ')' : ''}</span></div>
+        ${tierBadge(r)}
+        ${d ? `<b>${d.points} pts (+${d.coins_earned} 🪙)</b>` : '<span class="muted">Pas d\'équipe</span>'}
+        <span class="pill finished">${STATE_LABEL.finished}</span></a>`;
+    }).join('') : '<div class="panel"><p>Aucune course terminée ne correspond.</p></div>';
+  };
+  $('#rq').oninput = draw;
+  $('#rf').oninput = draw;
+  draw();
+}
+ 
+async function pageTeam(arg) {
+  if (arg === 'terminees') return pageFinishedRaces();
+  if (arg) return composer(+arg);
   const [races, mine, doneRaces] = await Promise.all([
     q(sb.from('races').select('*').eq('status', 'upcoming').order('start_at')),
     q(sb.from('lineups').select('race_id,points,coins_earned').eq('user_id', state.uid)),
-    q(sb.from('races').select('*').eq('status', 'finished').order('start_at', { ascending: false }).limit(40)),
+    q(sb.from('races').select('*').eq('status', 'finished').order('start_at', { ascending: false }).limit(5)),
   ]);
   const mineMap = new Map(mine.map(m => [m.race_id, m]));
   app.innerHTML = `<h1>Équipe</h1>
-    <p class="lead">Compose ton équipe de ${TEAM_SIZE} coureurs à partir de 5 jours avant le départ, et choisis un capitaine. Elle se verrouille au départ de la vraie course. Ensuite, tes points sont calculés automatiquement d'après le classement réel : les ${MAX_POSITION} premiers rapportent des points, ton capitaine compte double s'il finit dans le Top ${CAPTAIN_TOP}, et le prestige de la course multiplie le tout (Tier 1 ${fmtMult(2)}, Tier 2 ${fmtMult(1.5)}, Tier 3 ${fmtMult(1)}).</p>
+    ${teamTabs('avenir')}
+    <p class="lead">Compose ton équipe de ${TEAM_SIZE} coureurs à partir de 5 jours avant le départ, et choisis un capitaine. Elle se verrouille au départ de la vraie course. Ensuite, tes points sont calculés automatiquement d'après le classement réel : les ${MAX_POSITION} premiers rapportent des points, ton capitaine compte double s'il finit dans le Top ${CAPTAIN_TOP}, et le prestige de la course multiplie le tout (${Object.values(TIERS).map(t => `${t.label} ${fmtMult(t.mult)}`).join(', ')}).</p>
     <div class="race-list">${races.length ? races.map(r => {
       const s = raceState(r);
       return `<a class="panel race-item t${tierOf(r)}" href="#/equipe/${r.id}" style="text-decoration:none">
@@ -1484,7 +1542,7 @@ async function pageTeam(raceId) {
         ${mineMap.has(r.id) ? '<span class="pill">Équipe enregistrée</span>' : ''}
         <span class="pill ${s}">${STATE_LABEL[s]}</span></a>`;
     }).join('') : '<div class="panel"><p>Aucune course à venir pour le moment.</p></div>'}</div>
-    ${doneRaces.length ? `<h2 style="margin-top:2rem">Courses terminées</h2>
+    ${doneRaces.length ? `<h2 style="margin-top:2rem">Dernières courses terminées</h2>
     <div class="race-list">${doneRaces.map(r => {
       const d = mineMap.get(r.id);
       return `<a class="panel race-item t${tierOf(r)}" href="#/equipe/${r.id}" style="text-decoration:none">
@@ -1492,7 +1550,8 @@ async function pageTeam(raceId) {
         ${tierBadge(r)}
         ${d ? `<b>${d.points} pts (+${d.coins_earned} 🪙)</b>` : '<span class="muted">Pas d\'équipe</span>'}
         <span class="pill finished">${STATE_LABEL.finished}</span></a>`;
-    }).join('')}</div>` : ''}`;
+    }).join('')}</div>
+    <p><a class="btn" href="#/equipe/terminees" style="text-decoration:none">🏁 Voir toutes les courses terminées</a></p>` : ''}`;
 }
 
 async function composer(raceId) {
@@ -1537,6 +1596,9 @@ async function composer(raceId) {
   const byRider = new Map(groups.map(g => [g.rider.id, g]));
   const lineupRiders = new Map((lineup?.lineup_cards || []).map(lc => [lc.rider_id, lc.riders]));
   const riderOf = rid => byRider.get(rid)?.rider || lineupRiders.get(rid);
+   /* Listes pour les filtres « Equipe » et « Profil » de Ma collection */
+  const myTeams = [...new Set(groups.map(g => g.rider.team).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const mySpecs = SPECIALTIES.filter(s => groups.some(g => g.rider.specialty === s));
 
   const sel = new Map();               // rider_id -> user_card_id
   let captain = lineup?.captain_rider_id ?? null;
@@ -1569,7 +1631,7 @@ async function composer(raceId) {
       : resRows.map(o => ({ pos: o.pos, name: o.riders?.name || '?', rider: o.riders }));
     top30Panel = `<div class="panel">
       <h2 style="margin-top:0">Classement officiel de la course</h2>
-      <p class="muted">Les ${MAX_POSITION} premiers rapportent des points. « Pts de course » = points de base × coefficient de la course (${fmtMult(cm)}), avant bonus de rareté et de capitaine.${official.length ? '' : ' Course validée avant la mise à jour : seuls les coureurs du jeu sont listés.'}</p>
+      <p class="muted">Les ${MAX_POSITION} premiers rapportent des points. « Pts de course » = points de base × coefficient de la course (${fmtMult(cm)}), avant bonus de capitaine.${official.length ? '' : ' Course validée avant la mise à jour : seuls les coureurs du jeu sont listés.'}</p>
       ${rows30.length ? `<div class="table-wrap"><table class="top30">
         <thead><tr><th class="num">Place</th><th>Coureur</th><th>Équipe</th><th class="num">Points de base</th><th class="num">Pts de course</th></tr></thead>
         <tbody>${rows30.map(o => `<tr class="${o.pos <= 3 ? 'p' + o.pos : ''} ${o.rider && myIds.has(o.rider.id) ? 'mine' : ''}">
@@ -1618,14 +1680,19 @@ async function composer(raceId) {
     ${compPanel}
     <details class="panel">
       <summary><b>Voir le barème complet (1er au ${MAX_POSITION}e)</b></summary>
-      <p class="muted" style="margin-top:.6rem">Points de base, avant les multiplicateurs : bonus de rareté ${RARITY_ORDER.map(r => `${RARITY[r].label} ${fmtMult(RARITY[r].mult)}`).join(', ')} ; coefficient de la course ${Object.values(TIERS).map(t => `${t.label} ${fmtMult(t.mult)}`).join(', ')}. Les cartes mythiques vintage rapportent un bonus fixe de ${MYTHIC_BONUS} points, multiplié par le coefficient de la course.</p>
+      <p class="muted" style="margin-top:.6rem">Points de base, avant les multiplicateurs. Coefficient de la course : ${Object.values(TIERS).map(t => `${t.label} (${t.long}) ${fmtMult(t.mult)}`).join(', ')}. Les cartes mythiques vintage rapportent un bonus fixe de ${MYTHIC_BONUS} points, multiplié par le coefficient de la course.</p>
       ${baremeTable()}
     </details>
-    ${editable ? `<h2>Ma collection</h2>
+  ${editable ? `<h2>Ma collection</h2>
     <div class="filters">
+      <label>Recherche<input id="fq" placeholder="Nom du coureur" autocomplete="off"></label>
+      <label>Équipe<select id="ft"><option value="">Toutes les équipes</option>${myTeams.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join('')}</select></label>
+      <label>Profil<select id="fs"><option value="">Tous les profils</option>${mySpecs.map(s => `<option value="${s}">${esc(SPECIALTY_LABEL[s] || cap1(s))}</option>`).join('')}</select></label>
       <label>Rareté<select id="fr"><option value="">Toutes</option>${RARITY_ORDER.map(r => `<option value="${r}">${RARITY[r].label}</option>`).join('')}</select></label>
-      <label>Recherche<input id="fq" placeholder="Nom du coureur"></label>
+      <label>Tri<select id="fo"><option value="rar">Rareté</option><option value="name">Nom (A-Z)</option><option value="team">Équipe</option></select></label>
+      <button class="btn small" id="freset" type="button">Réinitialiser</button>
     </div>
+    <p class="muted" id="fcount"></p>
     <div class="cards" id="grid"></div>` : ''}`;
 
   /* ----- Rapport en fenêtre ----- */
@@ -1677,14 +1744,24 @@ async function composer(raceId) {
     }).join('');
     $$('[data-cap]').forEach(b => b.onclick = () => { captain = +b.dataset.cap; drawSlots(); });
   };
-  const drawGrid = () => {
+ const drawGrid = () => {
     if (!editable) return;
-    const fr = $('#fr').value, fq = $('#fq').value.toLowerCase();
-    const list = groups.filter(g => (!fr || g.rider.rarity === fr) && g.rider.name.toLowerCase().includes(fq))
-      .sort((a, b) => rarityIdx(b.rider.rarity) - rarityIdx(a.rider.rarity) || a.rider.name.localeCompare(b.rider.name));
+    const fq = nameKey($('#fq').value), ft = $('#ft').value, fs = $('#fs').value, fr = $('#fr').value, fo = $('#fo').value;
+    const cmpName = (a, b) => a.rider.name.localeCompare(b.rider.name);
+    const sorters = {
+      rar: (a, b) => rarityIdx(b.rider.rarity) - rarityIdx(a.rider.rarity) || cmpName(a, b),
+      name: cmpName,
+      team: (a, b) => (a.rider.team ? 0 : 1) - (b.rider.team ? 0 : 1) || (a.rider.team || '').localeCompare(b.rider.team || '') || cmpName(a, b),
+    };
+    const list = groups.filter(g => (!fq || nameKey(g.rider.name).includes(fq))
+        && (!ft || g.rider.team === ft)
+        && (!fs || g.rider.specialty === fs)
+        && (!fr || g.rider.rarity === fr))
+      .sort(sorters[fo] || sorters.rar);
+    $('#fcount').textContent = `${list.length} coureur${list.length > 1 ? 's' : ''} affiché${list.length > 1 ? 's' : ''} sur ${groups.length}`;
     $('#grid').innerHTML = list.length ? list.map(g => `<div class="card-wrap">${cardHTML(g.rider, {
       count: g.free.length, cls: 'pick ' + (sel.has(g.rider.id) ? 'sel' : (sel.size >= TEAM_SIZE ? 'dim' : '')), attrs: `data-rid="${g.rider.id}" tabindex="0"`,
-    })}</div>`).join('') : '<p class="muted">Aucun coureur disponible. Les cartes en vente ne peuvent pas être alignées.</p>';
+    })}</div>`).join('') : '<p class="muted">Aucun coureur ne correspond à ces filtres (les cartes en vente ne peuvent pas être alignées).</p>';
     $$('#grid .card').forEach(c => {
       const toggle = () => {
         const rid = +c.dataset.rid;
@@ -1698,8 +1775,12 @@ async function composer(raceId) {
   };
   drawSlots(); drawGrid();
   if (!editable) return;
-  $('#fr').oninput = drawGrid; $('#fq').oninput = drawGrid;
-  $('#save').onclick = async () => {
+  $$('#fq,#ft,#fs,#fr,#fo').forEach(el => { el.oninput = drawGrid; });
+  $('#freset').onclick = () => {
+    $('#fq').value = ''; $('#ft').value = ''; $('#fs').value = ''; $('#fr').value = ''; $('#fo').value = 'rar';
+    drawGrid();
+  };
+   $('#save').onclick = async () => {
     if (sel.size !== TEAM_SIZE) return toast(`Il faut exactement ${TEAM_SIZE} coureurs.`, 'error');
     if (!captain) return toast('Choisis un capitaine.', 'error');
     const r = await rpc('save_lineup', { p_race_id: raceId, p_card_ids: [...sel.values()], p_captain_rider: captain });
@@ -1947,7 +2028,7 @@ async function pageWallet() {
     <h2 style="margin-top:1.5rem">Barème</h2>
     <div class="panel">
       <p>Les ${MAX_POSITION} premiers de chaque course rapportent des points de base : 1<sup>er</sup> : ${POSITION_POINTS[0]}, 2<sup>e</sup> : ${POSITION_POINTS[1]}, 3<sup>e</sup> : ${POSITION_POINTS[2]}, puis une baisse marquée jusqu'au 10<sup>e</sup> (${POSITION_POINTS[9]}) et plus douce jusqu'au ${MAX_POSITION}<sup>e</sup> (${POSITION_POINTS[MAX_POSITION - 1]}). Au-delà : 0.</p>
-      <p>Multiplicateur de rareté : ${RARITY_ORDER.map(r => `${RARITY[r].label} ${fmtMult(RARITY[r].mult)}`).join(', ')}. Capitaine ${fmtMult(CAPTAIN_MULT)} s'il termine dans le Top ${CAPTAIN_TOP}. Coefficient de prestige de la course : ${Object.values(TIERS).map(t => `${t.label} (${t.long}) ${fmtMult(t.mult)}`).join(', ')}. Les cartes mythiques vintage (coureurs retraités) rapportent un bonus fixe de ${MYTHIC_BONUS} points, multiplié par le coefficient de la course. 1 point = 1 pièce.</p>
+       <p>La rareté d'une carte ne change pas les points. Capitaine ${fmtMult(CAPTAIN_MULT)} s'il termine dans le Top ${CAPTAIN_TOP}. Coefficient de prestige de la course : ${Object.values(TIERS).map(t => `${t.label} (${t.long}) ${fmtMult(t.mult)}`).join(', ')}. Les cartes mythiques vintage (coureurs retraités) rapportent un bonus fixe de ${MYTHIC_BONUS} points, multiplié par le coefficient de la course. 1 point = 1 pièce.</p>
       <details><summary><b>Tableau complet</b></summary>${baremeTable()}</details>
     </div>`;
 
@@ -2875,10 +2956,10 @@ async function pageAdmin(tab = 'general') {
       <p><button class="btn primary" id="vBtn" disabled>Valider et calculer les scores</button></p></div>
 
     <div class="panel"><h2>Prestige des courses</h2>
-      <p class="muted">Le coefficient multiplie tous les points d'une course : Tier 1 (Grands Tours et Monuments) ${fmtMult(2)}, Tier 2 (WorldTour) ${fmtMult(1.5)}, Tier 3 (ProSeries, Europe Tour) ${fmtMult(1)}. Règle-le avant la validation : il est figé ensuite.</p>
+       <p class="muted">Le coefficient multiplie tous les points d'une course : ${Object.values(TIERS).map(t => `${t.label} (${t.long}) ${fmtMult(t.mult)}`).join(' ; ')}. Règle-le avant la validation : il est figé ensuite. Vérifie surtout les courses reclassées automatiquement.</p>
       <div class="table-wrap"><table><thead><tr><th>Course</th><th>Date</th><th>Catégorie</th><th>Prestige</th></tr></thead><tbody>
         ${races.length ? races.map(r => `<tr><td><b>${esc(r.name)}</b></td><td>${fmtDate(r.start_at)}</td><td>${esc(r.category || '–')}</td>
-          <td><select data-tier="${r.id}" aria-label="Prestige de ${esc(r.name)}">${[1, 2, 3].map(t => `<option value="${t}" ${tierOf(r) === t ? 'selected' : ''}>${TIERS[t].label} · ${esc(TIERS[t].long)} (${fmtMult(TIERS[t].mult)})</option>`).join('')}</select></td></tr>`).join('')
+          <td><select data-tier="${r.id}" aria-label="Prestige de ${esc(r.name)}">${[1, 2, 3, 4].map(t => `<option value="${t}" ${tierOf(r) === t ? 'selected' : ''}>${TIERS[t].label} · ${esc(TIERS[t].long)} (${fmtMult(TIERS[t].mult)})</option>`).join('')}</select></td></tr>`).join('')
           : '<tr><td colspan="4" class="muted">Aucune course à venir.</td></tr>'}
       </tbody></table></div></div>
 
@@ -2906,7 +2987,7 @@ async function pageAdmin(tab = 'general') {
       <p style="margin-top:.8rem"><button class="btn primary" id="gBtn">Envoyer le cadeau</button></p></div>
 
     <div class="panel"><h2>Ajouter des courses</h2>
-      <p class="muted">Une course par ligne, format : <code>Nom;Catégorie;AAAA-MM-JJ HH:MM;Prestige</code> (heure de départ de ton fuseau). Le prestige est facultatif : 1 (Grands Tours et Monuments), 2 (WorldTour) ou 3 (ProSeries, par défaut). Copie les courses du calendrier L'Équipe puis mets-les à ce format.</p>
+     <p class="muted">Une course par ligne, format : <code>Nom;Catégorie;AAAA-MM-JJ HH:MM;Prestige</code> (heure de départ de ton fuseau). Le prestige est facultatif : 1 (Grands Tours, Mondiaux, Monuments), 2 (WorldTour, Europe, Nationaux), 3 (ProSeries .Pro) ou 4 (continentales). S'il manque, il est déduit du nom et de la catégorie (ex. « WorldTour », « 1.Pro », « 2.1 »). Copie les courses du calendrier L'Équipe puis mets-les à ce format.</p>
       <textarea id="raceCsv" placeholder="Il Lombardia;WorldTour;2026-10-10 10:30;1"></textarea>
       <p><button class="btn" id="raceBtn">Importer les courses</button></p></div>
 
@@ -3252,14 +3333,14 @@ async function pageAdmin(tab = 'general') {
     refreshStatus();
   };
 
-  /* ----- Import des courses (prestige facultatif en 4e champ) ----- */
+  /* ----- Import des courses (prestige facultatif en 4e champ, sinon deduit) ----- */
   $('#raceBtn').onclick = async () => {
     const rows = []; const bad = [];
     for (const line of $('#raceCsv').value.split('\n').map(l => l.trim()).filter(Boolean)) {
       const [name, category = '', dt, tierRaw = ''] = line.split(';').map(s => s.trim());
       const d = dt ? new Date(dt.replace(' ', 'T')) : null;
-      const tier = tierRaw === '' ? 3 : parseInt(tierRaw, 10);
-      if (!name || !d || isNaN(d) || ![1, 2, 3].includes(tier)) { bad.push(line); continue; }
+      const tier = tierRaw === '' ? guessTier(name, category) : parseInt(tierRaw, 10);
+      if (!name || !d || isNaN(d) || ![1, 2, 3, 4].includes(tier)) { bad.push(line); continue; }
       rows.push({ name, category, start_at: d.toISOString(), tier_level: tier });
     }
     if (bad.length) return toast('Ligne invalide : ' + bad[0], 'error');
