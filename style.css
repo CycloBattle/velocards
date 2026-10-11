@@ -512,3 +512,13 @@ code { background: #fff; border: 1px solid var(--line); border-radius: 4px; padd
 .cmark { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; min-height: 1.5rem; font-size: 13px; }
 .cmark b { font: 800 1.1rem var(--font-display); }
 .comp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: .8rem; margin: 1rem 0; }
+
+/* ---------- Prestige à 4 niveaux et onglets de la page Équipe (ajout) ---------- */
+.tier.t3 { background: #1C8C52; border-color: #14653B; color: #fff; }
+.tier.t4 { background: #E4E8EC; border-color: var(--line); color: var(--muted); }
+.race-item.t3 { border-left: 6px solid #1C8C52; }
+.race-item.t4 { border-left: 6px solid var(--line); }
+
+.team-tabs { margin-top: 0; }
+.team-tabs a { font-size: 15px; padding: .5rem 1.1rem; }
+.team-tabs a:not(.on):hover { background: var(--yellow); }
